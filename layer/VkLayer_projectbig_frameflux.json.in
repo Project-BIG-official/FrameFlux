@@ -1,0 +1,17 @@
+{
+    "file_format_version": "1.2.0",
+    "layer": {
+        "name": "VK_LAYER_PROJECTBIG_FrameFlux",
+        "type": "GLOBAL",
+        "library_path": "@CMAKE_CURRENT_BINARY_DIR@/libVkLayer_projectbig_frameflux.so",
+        "api_version": "1.3.0",
+        "implementation_version": "1",
+        "description": "ProjectBig FrameFlux: Universal Adaptive Frame Generation Runtime",
+        "enable_environment": {
+            "ENABLE_FRAMEFLUX": "1"
+        },
+        "disable_environment": {
+            "DISABLE_FRAMEFLUX": "1"
+        }
+    }
+}

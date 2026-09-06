@@ -1,0 +1,91 @@
+# ===== Build directories =====
+build/
+build-*/
+cmake-build-*/
+out/
+bin/
+obj/
+
+# ===== CMake =====
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+Makefile
+cmake/
+
+# ===== Visual Studio =====
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.VC.opendb
+Debug/
+Release/
+x64/
+x86/
+
+# ===== Compiled files =====
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.dylib
+*.exe
+*.out
+*.app
+
+# ===== Debug / profiling =====
+*.dSYM/
+*.gcda
+*.gcno
+*.profraw
+*.profdata
+
+# ===== IDEs =====
+.vscode/
+.idea/
+*.iml
+
+# ===== clangd =====
+.clangd/
+.cache/
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== Logs =====
+*.log
+
+# ===== Temporary files =====
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# ===== Conan / vcpkg =====
+.conan/
+conan.lock
+.vcpkg/
+vcpkg_installed/
+
+# ===== Environment / secrets =====
+.env
+.env.*
+!.env.example
+
+# ===== Coverage =====
+coverage/
+*.gcov
+
+# ===== Compiled Shaders =====
+*.spv
