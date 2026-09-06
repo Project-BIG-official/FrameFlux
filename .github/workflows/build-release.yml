@@ -1,0 +1,84 @@
+name: Build Universal PB FrameFlux Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  build-matrix:
+    runs-on: ubuntu-22.04 # Target base glibc 2.35 for universal Linux / SteamOS support
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86-64-v2, x86-64-v3, x86-64-v4]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Vulkan SDK & Build Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++-12 libvulkan-dev vulkan-tools
+
+      - name: Install Slang Compiler (slangc)
+        run: |
+          SLANG_VERSION="2024.13.1"
+          wget -q https://github.com/shader-slang/slang/releases/download/v${SLANG_VERSION}/slang-${SLANG_VERSION}-linux-x86_64.zip
+          unzip -q slang-${SLANG_VERSION}-linux-x86_64.zip -d slang
+          sudo cp slang/bin/slangc /usr/local/bin/
+          sudo cp slang/lib/libslang.so /usr/local/lib/
+          sudo ldconfig
+          slangc -version
+
+      - name: Configure CMake (Extreme Optimization + Static Libstdc++)
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++-12 \
+            -DFRAMEFLUX_ARCH=${{ matrix.arch }} \
+            -DFRAMEFLUX_ENABLE_LTO=ON \
+            -DFRAMEFLUX_STATIC_STDLIB=ON
+
+      - name: Compile PB FrameFlux
+        run: cmake --build build --parallel $(nproc)
+
+      - name: Strip Binary
+        run: strip --strip-unneeded build/libVkLayer_projectbig_frameflux.so
+
+      - name: Package Architecture Tarball
+        run: |
+          DIST_DIR="PB-FrameFlux-${{ matrix.arch }}"
+          mkdir -p $DIST_DIR
+          cp build/libVkLayer_projectbig_frameflux.so $DIST_DIR/
+          cp build/VkLayer_projectbig_frameflux.json $DIST_DIR/
+          cp LICENSE $DIST_DIR/
+          tar -czvf "PB-FrameFlux-${{ matrix.arch }}.tar.gz" $DIST_DIR
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PB-FrameFlux-${{ matrix.arch }}
+          path: "PB-FrameFlux-${{ matrix.arch }}.tar.gz"
+
+  publish-release:
+    needs: build-matrix
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all built artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            PB-FrameFlux-x86-64-v2/PB-FrameFlux-x86-64-v2.tar.gz
+            PB-FrameFlux-x86-64-v3/PB-FrameFlux-x86-64-v3.tar.gz
+            PB-FrameFlux-x86-64-v4/PB-FrameFlux-x86-64-v4.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
