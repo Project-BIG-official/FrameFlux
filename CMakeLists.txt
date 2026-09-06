@@ -4,33 +4,61 @@
 cmake_minimum_required(VERSION 3.22)
 project(PB_FrameFlux LANGUAGES CXX)
 
-# Export compile_commands.json for VS Code IntelliSense / Clangd
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# Compiler optimization and warning flags
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    add_compile_options(-Wall -Wextra -Wno-unused-parameter -O3)
+# -----------------------------------------------------------------------------
+# Optimization & Portability Options
+# -----------------------------------------------------------------------------
+option(FRAMEFLUX_ENABLE_LTO "Enable Link-Time Optimization (LTO)" OFF) # OFF by default for fast dev
+option(FRAMEFLUX_STATIC_STDLIB "Statically link libstdc++ and libgcc" OFF)
+set(FRAMEFLUX_ARCH "native" CACHE STRING "Target CPU architecture: native, x86-64-v2, x86-64-v3, x86-64-v4")
+
+# Basic compiler warnings
+add_compile_options(-Wall -Wextra -Wno-unused-parameter)
+
+# Architecture optimization flag
+if(NOT FRAMEFLUX_ARCH STREQUAL "none")
+    add_compile_options(-march=${FRAMEFLUX_ARCH})
+    message(STATUS "[FrameFlux] Targeting CPU architecture: -march=${FRAMEFLUX_ARCH}")
+endif()
+
+# Release Mode Extreme Optimizations
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    add_compile_options(-O3 -fno-plt)
+    add_link_options(-Wl,-O1 -Wl,--as-needed -Wl,-z,relro -Wl,-z,now)
+
+    # Static C++ Runtime for universal glibcxx portability
+    if(FRAMEFLUX_STATIC_STDLIB)
+        add_link_options(-static-libgcc -static-libstdc++)
+        message(STATUS "[FrameFlux] Statically linking libgcc & libstdc++")
+    endif()
+
+    # Link-Time Optimization (LTO)
+    if(FRAMEFLUX_ENABLE_LTO)
+        include(CheckIPOSupported)
+        check_ipo_supported(RESULT ipo_supported OUTPUT ipo_error)
+        if(ipo_supported)
+            set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+            message(STATUS "[FrameFlux] Link-Time Optimization (LTO) ENABLED")
+        else()
+            message(WARNING "[FrameFlux] LTO not supported: ${ipo_error}")
+        endif()
+    endif()
 endif()
 
 # -----------------------------------------------------------------------------
-# Find Dependencies
+# Dependencies
 # -----------------------------------------------------------------------------
-
-# Find Vulkan Headers & Loader
 find_package(Vulkan REQUIRED)
-
-# Find Slang Compiler (slangc)
 find_program(SLANGC_EXECUTABLE slangc REQUIRED)
 message(STATUS "Found Slang compiler: ${SLANGC_EXECUTABLE}")
 
 # -----------------------------------------------------------------------------
-# Slang to SPIR-V Compilation & Header Embedding Pipeline
+# Shader Compilation (Slang -> SPIR-V -> Embedded Header)
 # -----------------------------------------------------------------------------
-
 set(SHADER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
 set(GENERATED_SHADER_HEADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated_shaders")
 file(MAKE_DIRECTORY ${GENERATED_SHADER_HEADER_DIR})
@@ -48,7 +76,6 @@ foreach(SHADER_PATH ${SLANG_SHADERS})
     set(SPV_FILE "${GENERATED_SHADER_HEADER_DIR}/${SHADER_NAME}.spv")
     set(HEADER_FILE "${GENERATED_SHADER_HEADER_DIR}/${SHADER_NAME}_spv.hpp")
 
-# Compile Slang -> SPIR-V -> Generate C++ Header via Python
     add_custom_command(
         OUTPUT ${HEADER_FILE}
         COMMAND ${SLANGC_EXECUTABLE} ${SHADER_PATH}
@@ -57,21 +84,20 @@ foreach(SHADER_PATH ${SLANG_SHADERS})
                 -entry computeMain
                 -stage compute
                 -o ${SPV_FILE}
-        COMMAND python3 -c "b = open('${SPV_FILE}', 'rb').read(); open('${HEADER_FILE}', 'w').write('#pragma once\\n#include <cstdint>\\n#include <cstddef>\\n\\ninline const uint8_t ${SHADER_NAME}_spv[] = {\\n' + ', '.join(map(str, b)) + '\\n};\\n\\ninline const size_t ${SHADER_NAME}_spv_size = sizeof(${SHADER_NAME}_spv);\\n')"
+        COMMAND python3 -c "b = open('${SPV_FILE}', 'rb').read(); open('${HEADER_FILE}', 'w').write('#pragma once\\n#include <cstdint>\\n#include <cstddef>\\n\\nalignas(4) inline const uint8_t ${SHADER_NAME}_spv[] = {\\n' + ', '.join(map(str, b)) + '\\n};\\n\\ninline const size_t ${SHADER_NAME}_spv_size = sizeof(${SHADER_NAME}_spv);\\n')"
         DEPENDS ${SHADER_PATH}
-        COMMENT "Compiling Slang shader ${SHADER_NAME}.slang to embedded header"
+        COMMENT "Compiling Slang shader ${SHADER_NAME}.slang"
         VERBATIM
     )
 
     list(APPEND GENERATED_SPV_HEADERS ${HEADER_FILE})
 endforeach()
-# Target for shaders
+
 add_custom_target(FrameFluxShaders DEPENDS ${GENERATED_SPV_HEADERS})
 
 # -----------------------------------------------------------------------------
-# Build Vulkan Layer Library
+# Build Layer Target
 # -----------------------------------------------------------------------------
-
 set(LAYER_SOURCES
     layer/layer_entrypoints.cpp
     layer/swapchain_interceptor.cpp
@@ -83,7 +109,6 @@ set(LAYER_HEADERS
     layer/compute_engine.hpp
 )
 
-# Output target name: libVkLayer_projectbig_frameflux.so
 add_library(VkLayer_projectbig_frameflux SHARED
     ${LAYER_SOURCES}
     ${LAYER_HEADERS}
@@ -102,7 +127,6 @@ target_link_libraries(VkLayer_projectbig_frameflux PRIVATE
     Vulkan::Vulkan
 )
 
-# Hide non-exported symbols to strictly follow Khronos Layer conventions
 set_target_properties(VkLayer_projectbig_frameflux PROPERTIES
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON
@@ -110,13 +134,10 @@ set_target_properties(VkLayer_projectbig_frameflux PROPERTIES
 )
 
 # -----------------------------------------------------------------------------
-# Generate JSON Manifest
+# Manifest Configuration
 # -----------------------------------------------------------------------------
-
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/layer/VkLayer_projectbig_frameflux.json.in"
     "${CMAKE_CURRENT_BINARY_DIR}/VkLayer_projectbig_frameflux.json"
     @ONLY
 )
-
-message(STATUS "Configured VK_LAYER_PROJECTBIG_FrameFlux")

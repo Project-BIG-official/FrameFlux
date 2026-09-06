@@ -89,3 +89,7 @@ coverage/
 
 # ===== Compiled Shaders =====
 *.spv
+
+# ===== Github =====
+.github/
+*.sh
