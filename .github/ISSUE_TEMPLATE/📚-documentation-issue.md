@@ -2,7 +2,7 @@
 name: "\U0001F4DA Documentation Issue"
 about: Report incorrect, missing, outdated, or unclear documentation.
 title: "[DOC]"
-labels: ''
+labels: 'type: documentation'
 assignees: ''
 
 ---

@@ -2,8 +2,9 @@
 name: "\U0001F41B Bug Report"
 about: Report a reproducible bug or unexpected behavior in FrameFlux.
 title: "[BUG]"
-labels: bug
+labels: 'type: bug'
 assignees: ''
+type: Bug
 
 ---
 

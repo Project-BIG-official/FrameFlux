@@ -2,8 +2,9 @@
 name: "✨ Feature Request"
 about: Suggest a new feature or improvement for FrameFlux.
 title: "[FR]"
-labels: ''
+labels: 'type: feature'
 assignees: ''
+type: Feature
 
 ---
 

@@ -3,7 +3,7 @@ name: "\U0001F4CA Performance Issue"
 about: Report FPS, frame pacing, latency, stuttering, or frame generation performance
   issues.
 title: "[PERF]"
-labels: ''
+labels: 'type: performance'
 assignees: ''
 
 ---

@@ -2,7 +2,7 @@
 name: "\U0001F6E0️ Build / Installation Issue"
 about: Report build failures, installation problems, or missing dependencies.
 title: "[BUILD]"
-labels: ''
+labels: 'type: build, type: installation'
 assignees: ''
 
 ---

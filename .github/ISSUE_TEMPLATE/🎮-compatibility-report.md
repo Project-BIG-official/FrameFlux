@@ -2,7 +2,7 @@
 name: "\U0001F3AE Compatibility Report"
 about: Report compatibility issues with a specific game or application.
 title: "[COMPAT]"
-labels: ''
+labels: 'type: compatibility'
 assignees: ''
 
 ---
