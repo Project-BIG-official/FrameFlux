@@ -10,7 +10,7 @@ on:
 
 jobs:
   build-matrix:
-    runs-on: ubuntu-22.04 # Target base glibc 2.35 for universal Linux / SteamOS support
+    runs-on: ubuntu-22.04 # Base glibc 2.35 for universal Linux & SteamOS compatibility
     strategy:
       fail-fast: false
       matrix:
@@ -23,15 +23,17 @@ jobs:
       - name: Install Vulkan SDK & Build Tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build g++-12 libvulkan-dev vulkan-tools
+          sudo apt-get install -y cmake ninja-build g++-12 libvulkan-dev vulkan-tools curl unzip
 
       - name: Install Slang Compiler (slangc)
         run: |
-          SLANG_VERSION="2024.13.1"
-          wget -q https://github.com/shader-slang/slang/releases/download/v${SLANG_VERSION}/slang-${SLANG_VERSION}-linux-x86_64.zip
-          unzip -q slang-${SLANG_VERSION}-linux-x86_64.zip -d slang
+          # Use verified stable release of Slang
+          SLANG_VERSION="2025.23.1"
+          echo "[+] Downloading Slang v${SLANG_VERSION}..."
+          curl -fL "https://github.com/shader-slang/slang/releases/download/v${SLANG_VERSION}/slang-${SLANG_VERSION}-linux-x86_64.zip" -o slang.zip
+          unzip -q slang.zip -d slang
           sudo cp slang/bin/slangc /usr/local/bin/
-          sudo cp slang/lib/libslang.so /usr/local/lib/
+          sudo cp slang/lib/libslang*.so /usr/local/lib/ || true
           sudo ldconfig
           slangc -version
 
@@ -53,11 +55,11 @@ jobs:
       - name: Package Architecture Tarball
         run: |
           DIST_DIR="PB-FrameFlux-${{ matrix.arch }}"
-          mkdir -p $DIST_DIR
-          cp build/libVkLayer_projectbig_frameflux.so $DIST_DIR/
-          cp build/VkLayer_projectbig_frameflux.json $DIST_DIR/
-          cp LICENSE $DIST_DIR/
-          tar -czvf "PB-FrameFlux-${{ matrix.arch }}.tar.gz" $DIST_DIR
+          mkdir -p "$DIST_DIR"
+          cp build/libVkLayer_projectbig_frameflux.so "$DIST_DIR/"
+          cp build/VkLayer_projectbig_frameflux.json "$DIST_DIR/"
+          cp LICENSE* "$DIST_DIR/" 2>/dev/null || true
+          tar -czvf "PB-FrameFlux-${{ matrix.arch }}.tar.gz" "$DIST_DIR"
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
@@ -72,13 +74,12 @@ jobs:
     steps:
       - name: Download all built artifacts
         uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            PB-FrameFlux-x86-64-v2/PB-FrameFlux-x86-64-v2.tar.gz
-            PB-FrameFlux-x86-64-v3/PB-FrameFlux-x86-64-v3.tar.gz
-            PB-FrameFlux-x86-64-v4/PB-FrameFlux-x86-64-v4.tar.gz
+          files: release-artifacts/**/*.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
