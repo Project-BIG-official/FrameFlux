@@ -1,5 +1,5 @@
 // PB FrameFlux - LGPL-2.1
-// layer/swapchain_interceptor.cpp: Full Optical Flow, Warping & Double Present
+// layer/swapchain_interceptor.cpp: Safe Unity/DXVK Swapchain Interception
 
 #include "swapchain_interceptor.hpp"
 #include <algorithm>
@@ -8,10 +8,15 @@
 namespace FrameFlux {
 
 static uint32_t FindMemoryType(const VkPhysicalDeviceMemoryProperties& memProperties, uint32_t typeFilter, VkMemoryPropertyFlags properties) {
-    for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
-        if ((typeFilter & (1 << i)) && (memProperties.memoryTypes[i].propertyFlags & properties) == properties) {
-            return i;
+    if (memProperties.memoryTypeCount > 0) {
+        for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
+            if ((typeFilter & (1 << i)) && (memProperties.memoryTypes[i].propertyFlags & properties) == properties) {
+                return i;
+            }
         }
+    }
+    for (uint32_t i = 0; i < 32; i++) {
+        if (typeFilter & (1 << i)) return i;
     }
     return 0;
 }
@@ -34,9 +39,7 @@ static void TransitionImage(
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = image;
     barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    barrier.subresourceRange.baseMipLevel = 0;
     barrier.subresourceRange.levelCount = 1;
-    barrier.subresourceRange.baseArrayLayer = 0;
     barrier.subresourceRange.layerCount = 1;
     barrier.srcAccessMask = srcAccess;
     barrier.dstAccessMask = dstAccess;
@@ -44,35 +47,22 @@ static void TransitionImage(
     vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 }
 
-// -----------------------------------------------------------------------------
-// Singleton Getter (Fixed Missing Symbol)
-// -----------------------------------------------------------------------------
 Interceptor& Interceptor::Get() {
     static Interceptor instance;
     return instance;
 }
 
-bool Interceptor::CreateTexture(
-    VkDevice device,
-    VkPhysicalDevice physicalDevice,
-    uint32_t width,
-    uint32_t height,
-    VkFormat format,
-    VkImageUsageFlags usage,
-    VkImage& outImage,
-    VkDeviceMemory& outMemory,
-    VkImageView& outView
-) {
-    return false; // Deprecated by inline allocTex lambda
-}
-
-void Interceptor::AllocateFrameBuffers(SwapchainData& data) {
+bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
     uint32_t w = data.extent.width;
     uint32_t h = data.extent.height;
+
+    // Safety guard against 0x0 extent window initialization in Unity
+    if (w == 0 || h == 0) return false;
+
     uint32_t packedW = (w + 3) / 4;
 
     auto allocTex = [&](uint32_t width, uint32_t height, VkFormat format, VkImageUsageFlags usage,
-                        VkImage& outImg, VkDeviceMemory& outMem, VkImageView& outView) {
+                        VkImage& outImg, VkDeviceMemory& outMem, VkImageView& outView) -> bool {
         VkImageCreateInfo imageInfo{};
         imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
         imageInfo.imageType = VK_IMAGE_TYPE_2D;
@@ -86,10 +76,7 @@ void Interceptor::AllocateFrameBuffers(SwapchainData& data) {
         imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
-        if (vkCreateImage(data.device, &imageInfo, nullptr, &outImg) != VK_SUCCESS) {
-            std::cerr << "[PB FrameFlux] Failed to create image for format " << format << std::endl;
-            return;
-        }
+        if (vkCreateImage(data.device, &imageInfo, nullptr, &outImg) != VK_SUCCESS) return false;
 
         VkMemoryRequirements memReqs{};
         vkGetImageMemoryRequirements(data.device, outImg, &memReqs);
@@ -99,11 +86,8 @@ void Interceptor::AllocateFrameBuffers(SwapchainData& data) {
         allocInfo.allocationSize = memReqs.size;
         allocInfo.memoryTypeIndex = FindMemoryType(data.memoryProperties, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
-        if (vkAllocateMemory(data.device, &allocInfo, nullptr, &outMem) != VK_SUCCESS) {
-            std::cerr << "[PB FrameFlux] Failed to allocate device memory!" << std::endl;
-            return;
-        }
-        vkBindImageMemory(data.device, outImg, outMem, 0);
+        if (vkAllocateMemory(data.device, &allocInfo, nullptr, &outMem) != VK_SUCCESS) return false;
+        if (vkBindImageMemory(data.device, outImg, outMem, 0) != VK_SUCCESS) return false;
 
         VkImageViewCreateInfo viewInfo{};
         viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -114,31 +98,25 @@ void Interceptor::AllocateFrameBuffers(SwapchainData& data) {
         viewInfo.subresourceRange.levelCount = 1;
         viewInfo.subresourceRange.layerCount = 1;
 
-        vkCreateImageView(data.device, &viewInfo, nullptr, &outView);
+        return vkCreateImageView(data.device, &viewInfo, nullptr, &outView) == VK_SUCCESS;
     };
 
-    // 1. Frame history (sampled + transfer only, perfectly safe for SRGB on AMD)
     VkImageUsageFlags sampledUsage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-    allocTex(w, h, data.imageFormat, sampledUsage, data.frameAImage, data.frameAMemory, data.frameAView);
-    allocTex(w, h, data.imageFormat, sampledUsage, data.frameBImage, data.frameBMemory, data.frameBView);
+    if (!allocTex(w, h, data.imageFormat, sampledUsage, data.frameAImage, data.frameAMemory, data.frameAView)) return false;
+    if (!allocTex(w, h, data.imageFormat, sampledUsage, data.frameBImage, data.frameBMemory, data.frameBView)) return false;
 
-    // 2. Output generated image (storage + transfer, using standard R8G8B8A8_UNORM)
+    // Generated image uses standard format matching swapchain
     VkFormat genFormat = (data.imageFormat == VK_FORMAT_B8G8R8A8_SRGB) ? VK_FORMAT_B8G8R8A8_UNORM : data.imageFormat;
     VkImageUsageFlags storageUsage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-    allocTex(w, h, genFormat, storageUsage, data.generatedImage, data.generatedMemory, data.generatedView);
+    if (!allocTex(w, h, genFormat, storageUsage, data.generatedImage, data.generatedMemory, data.generatedView)) return false;
 
-    // 3. Packed Luminance textures
-    allocTex(packedW, h, VK_FORMAT_R32_UINT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, data.lumaAImage, data.lumaAMemory, data.lumaAView);
-    allocTex(packedW, h, VK_FORMAT_R32_UINT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, data.lumaBImage, data.lumaBMemory, data.lumaBView);
+    if (!allocTex(packedW, h, VK_FORMAT_R32_UINT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, data.lumaAImage, data.lumaAMemory, data.lumaAView)) return false;
+    if (!allocTex(packedW, h, VK_FORMAT_R32_UINT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, data.lumaBImage, data.lumaBMemory, data.lumaBView)) return false;
 
-    // 4. Dummy coarse motion field
-    allocTex(1, 1, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, data.dummyCoarseImage, data.dummyCoarseMemory, data.dummyCoarseView);
+    if (!allocTex(1, 1, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, data.dummyCoarseImage, data.dummyCoarseMemory, data.dummyCoarseView)) return false;
+    if (!allocTex(w, h, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT, data.motionImage, data.motionMemory, data.motionView)) return false;
+    if (!allocTex(w, h, VK_FORMAT_R8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT, data.confidenceImage, data.confidenceMemory, data.confidenceView)) return false;
 
-    // 5. Motion Vectors & Confidence
-    allocTex(w, h, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT, data.motionImage, data.motionMemory, data.motionView);
-    allocTex(w, h, VK_FORMAT_R8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT, data.confidenceImage, data.confidenceMemory, data.confidenceView);
-
-    // 6. Bilinear Sampler
     VkSamplerCreateInfo samplerInfo{};
     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     samplerInfo.magFilter = VK_FILTER_LINEAR;
@@ -148,7 +126,6 @@ void Interceptor::AllocateFrameBuffers(SwapchainData& data) {
     samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     vkCreateSampler(data.device, &samplerInfo, nullptr, &data.linearSampler);
 
-    // 7. Descriptor Pool
     std::vector<VkDescriptorPoolSize> poolSizes = {
         {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 10},
         {VK_DESCRIPTOR_TYPE_SAMPLER, 2},
@@ -161,7 +138,6 @@ void Interceptor::AllocateFrameBuffers(SwapchainData& data) {
     poolInfo.pPoolSizes = poolSizes.data();
     vkCreateDescriptorPool(data.device, &poolInfo, nullptr, &data.descriptorPool);
 
-    // 8. Descriptor Sets
     VkDescriptorSetAllocateInfo allocSetInfo{};
     allocSetInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     allocSetInfo.descriptorPool = data.descriptorPool;
@@ -179,7 +155,7 @@ void Interceptor::AllocateFrameBuffers(SwapchainData& data) {
     allocSetInfo.pSetLayouts = &warpLayout;
     vkAllocateDescriptorSets(data.device, &allocSetInfo, &data.warpDescSet);
 
-    // 9. Updates for Luma
+    // Updates
     VkDescriptorImageInfo lumaImgs[2]{
         {VK_NULL_HANDLE, data.frameBView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
         {VK_NULL_HANDLE, data.lumaBView,  VK_IMAGE_LAYOUT_GENERAL}
@@ -191,7 +167,6 @@ void Interceptor::AllocateFrameBuffers(SwapchainData& data) {
     lumaWrites[0].descriptorCount = 1;
     lumaWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     lumaWrites[0].pImageInfo = &lumaImgs[0];
-
     lumaWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     lumaWrites[1].dstSet = data.lumaDescSet;
     lumaWrites[1].dstBinding = 1;
@@ -200,7 +175,6 @@ void Interceptor::AllocateFrameBuffers(SwapchainData& data) {
     lumaWrites[1].pImageInfo = &lumaImgs[1];
     vkUpdateDescriptorSets(data.device, 2, lumaWrites, 0, nullptr);
 
-    // 10. Updates for Flow
     VkDescriptorImageInfo flowImgs[5]{
         {VK_NULL_HANDLE, data.lumaAView,        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
         {VK_NULL_HANDLE, data.lumaBView,        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
@@ -219,7 +193,6 @@ void Interceptor::AllocateFrameBuffers(SwapchainData& data) {
     }
     vkUpdateDescriptorSets(data.device, 5, flowWrites, 0, nullptr);
 
-    // 11. Updates for Warp
     VkDescriptorImageInfo warpImgs[6]{
         {VK_NULL_HANDLE, data.frameAView,     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
         {VK_NULL_HANDLE, data.frameBView,     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
@@ -238,6 +211,9 @@ void Interceptor::AllocateFrameBuffers(SwapchainData& data) {
         warpWrites[i].pImageInfo = &warpImgs[i];
     }
     vkUpdateDescriptorSets(data.device, 6, warpWrites, 0, nullptr);
+
+    data.buffersAllocated = true;
+    return true;
 }
 
 void Interceptor::CleanupSwapchainData(SwapchainData& data) {
@@ -268,13 +244,11 @@ void Interceptor::CleanupSwapchainData(SwapchainData& data) {
 
 VkResult Interceptor::OnCreateSwapchainKHR(
     VkDevice device,
-    const VkPhysicalDeviceMemoryProperties& memProperties,
     const VkSwapchainCreateInfoKHR* pCreateInfo,
     const VkAllocationCallbacks* pAllocator,
     VkSwapchainKHR* pSwapchain,
     PFN_vkCreateSwapchainKHR realFunc
 ) {
-    // 1. Expand buffer count cleanly
     VkSwapchainCreateInfoKHR modifiedCreateInfo = *pCreateInfo;
     modifiedCreateInfo.minImageCount = std::max(pCreateInfo->minImageCount + 2, 4u);
 
@@ -284,11 +258,15 @@ VkResult Interceptor::OnCreateSwapchainKHR(
         if (result != VK_SUCCESS) return result;
     }
 
-    m_computeEngine.Initialize(device, VK_NULL_HANDLE);
+    if (!m_computeEngineInitialized) {
+        m_computeEngine.Initialize(device, VK_NULL_HANDLE);
+        m_computeEngineInitialized = true;
+    }
 
     auto data = std::make_unique<SwapchainData>();
     data->device = device;
-    data->memoryProperties = memProperties;
+    data->memoryProperties = m_cachedMemProps;
+    data->queueFamilyIndex = m_cachedQueueFamily;
     data->swapchain = *pSwapchain;
     data->imageFormat = pCreateInfo->imageFormat;
     data->extent = pCreateInfo->imageExtent;
@@ -302,7 +280,7 @@ VkResult Interceptor::OnCreateSwapchainKHR(
     VkCommandPoolCreateInfo cmdPoolInfo{};
     cmdPoolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     cmdPoolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    cmdPoolInfo.queueFamilyIndex = 0;
+    cmdPoolInfo.queueFamilyIndex = m_cachedQueueFamily;
     vkCreateCommandPool(device, &cmdPoolInfo, nullptr, &data->commandPool);
 
     VkCommandBufferAllocateInfo cmdAllocInfo{};
@@ -332,7 +310,6 @@ VkResult Interceptor::OnCreateSwapchainKHR(
 
     AllocateFrameBuffers(*data);
 
-    std::cout << "[PB FrameFlux] Swapchain created with " << modifiedCreateInfo.minImageCount << " image buffers." << std::endl;
     m_swapchains[*pSwapchain] = std::move(data);
     return VK_SUCCESS;
 }
@@ -378,7 +355,6 @@ void Interceptor::DispatchGenerationPass(SwapchainData& data, VkQueue queue, uin
     fullCopyRegion.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     fullCopyRegion.extent = {w, h, 1};
 
-    // 1. Capture incoming game frame -> frameBImage
     TransitionImage(cmd, data.realImages[imageIndex], VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
     TransitionImage(cmd, data.frameBImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -387,14 +363,12 @@ void Interceptor::DispatchGenerationPass(SwapchainData& data, VkQueue queue, uin
     vkCmdCopyImage(cmd, data.realImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                    data.frameBImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &fullCopyRegion);
 
-    // 2. Luma Pack
     TransitionImage(cmd, data.frameBImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
     TransitionImage(cmd, data.lumaBImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_WRITE_BIT);
     m_computeEngine.RecordLumaPass(cmd, data.lumaDescSet, w, h);
 
-    // 3. Optical Flow Search
     TransitionImage(cmd, data.lumaBImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
     TransitionImage(cmd, data.lumaAImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -407,7 +381,6 @@ void Interceptor::DispatchGenerationPass(SwapchainData& data, VkQueue queue, uin
                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_WRITE_BIT);
     m_computeEngine.RecordFlowPass(cmd, data.flowDescSet, w, h);
 
-    // 4. Warp Interpolation
     TransitionImage(cmd, data.motionImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
     TransitionImage(cmd, data.confidenceImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -419,7 +392,7 @@ void Interceptor::DispatchGenerationPass(SwapchainData& data, VkQueue queue, uin
 
     WarpPushConstants pc{};
     pc.t = t;
-    pc.confidenceThreshold = 2.0f;
+    pc.confidenceThreshold = 2.0f; // Stable blend
     pc.fallbackAction = 1;
     pc.searchMode = 1;
     pc.resolutionX = w;
@@ -428,7 +401,6 @@ void Interceptor::DispatchGenerationPass(SwapchainData& data, VkQueue queue, uin
     pc.invResolutionY = 1.0f / static_cast<float>(h);
     m_computeEngine.RecordWarpPass(cmd, data.warpDescSet, pc, w, h);
 
-    // 5. Overwrite realImages[imageIndex] with Generated Frame G
     TransitionImage(cmd, data.generatedImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
     TransitionImage(cmd, data.realImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -440,11 +412,10 @@ void Interceptor::DispatchGenerationPass(SwapchainData& data, VkQueue queue, uin
     TransitionImage(cmd, data.realImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, 0);
 
-    // 6. History advance: frameB -> frameA, lumaB -> lumaA
     TransitionImage(cmd, data.frameBImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
     TransitionImage(cmd, data.frameAImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
     vkCmdCopyImage(cmd, data.frameBImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                    data.frameAImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &fullCopyRegion);
 
@@ -462,13 +433,11 @@ void Interceptor::DispatchGenerationPass(SwapchainData& data, VkQueue queue, uin
 
     vkEndCommandBuffer(cmd);
 
-// 11. Submit work to GPU queue and WAIT for completion before presenting
     VkSubmitInfo submitInfo{};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &cmd;
     vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
-
     vkQueueWaitIdle(queue);
 }
 
@@ -502,7 +471,7 @@ void Interceptor::PresentRealFrame(SwapchainData& data, VkQueue queue, uint32_t 
 
     vkEndCommandBuffer(cmd);
 
-VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
     VkSubmitInfo submitInfo{};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.waitSemaphoreCount = 1;
@@ -525,34 +494,35 @@ VkResult Interceptor::OnQueuePresentKHR(
 
         if (it != m_swapchains.end()) {
             SwapchainData& data = *(it->second);
+
+            // If buffers are not ready yet (0x0 extent initialization), pass through safely
+            if (!data.buffersAllocated) {
+                return realFunc(queue, pPresentInfo);
+            }
+
             data.frameCounter++;
 
             if (data.frameCounter > 2) {
                 float t = 0.5f;
                 ComputeAdaptiveTiming(data, t);
 
-                // 1. Generate frame G into realImages[imageIndex]
                 DispatchGenerationPass(data, queue, pPresentInfo->pImageIndices[i], t);
 
-                // 2. Present #1: Generated Frame G
                 VkPresentInfoKHR presentG = *pPresentInfo;
                 presentG.swapchainCount = 1;
                 presentG.pSwapchains = &data.swapchain;
                 presentG.pImageIndices = &pPresentInfo->pImageIndices[i];
                 realFunc(queue, &presentG);
 
-                // 3. Acquire next available buffer for Real Frame B
                 uint32_t secondImageIndex = 0;
                 VkResult acqRes = vkAcquireNextImageKHR(
                     data.device, data.swapchain, 50000000ULL,
                     data.internalAcquireSemaphore, VK_NULL_HANDLE, &secondImageIndex
                 );
 
-                if (acqRes == VK_SUCCESS || acqRes == VK_SUBOPTIMAL_KHR) {
-                    // 4. Blit real frame B into the second buffer
+                if ((acqRes == VK_SUCCESS || acqRes == VK_SUBOPTIMAL_KHR) && secondImageIndex < data.realImages.size()) {
                     PresentRealFrame(data, queue, secondImageIndex);
 
-                    // 5. Present #2: Real Frame B
                     VkPresentInfoKHR presentB{};
                     presentB.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
                     presentB.swapchainCount = 1;

@@ -1,5 +1,5 @@
 // PB FrameFlux - LGPL-2.1
-// layer/swapchain_interceptor.hpp: Swapchain State & Full Pipeline Orchestration
+// layer/swapchain_interceptor.hpp: Clean Decoupled Swapchain Interceptor
 
 #pragma once
 
@@ -17,10 +17,13 @@ namespace FrameFlux {
 struct SwapchainData {
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
-    VkPhysicalDeviceMemoryProperties memoryProperties{}; // Safe cached memory properties
+    VkPhysicalDeviceMemoryProperties memoryProperties{};
+    uint32_t queueFamilyIndex = 0;
     VkFormat imageFormat = VK_FORMAT_UNDEFINED;
     VkExtent2D extent = {0, 0};
     std::vector<VkImage> realImages;
+
+    bool buffersAllocated = false;
 
     // Command resources
     VkCommandPool commandPool = VK_NULL_HANDLE;
@@ -32,7 +35,7 @@ struct SwapchainData {
     VkSemaphore internalAcquireSemaphore = VK_NULL_HANDLE;
     uint64_t currentTimelineValue = 0;
 
-    // Full Color Frames (A = previous, B = current)
+    // Intermediate frame textures
     VkImage frameAImage = VK_NULL_HANDLE;
     VkDeviceMemory frameAMemory = VK_NULL_HANDLE;
     VkImageView frameAView = VK_NULL_HANDLE;
@@ -41,7 +44,6 @@ struct SwapchainData {
     VkDeviceMemory frameBMemory = VK_NULL_HANDLE;
     VkImageView frameBView = VK_NULL_HANDLE;
 
-    // Packed Luminance (4 pixels per uint32, width / 4 x height)
     VkImage lumaAImage = VK_NULL_HANDLE;
     VkDeviceMemory lumaAMemory = VK_NULL_HANDLE;
     VkImageView lumaAView = VK_NULL_HANDLE;
@@ -50,12 +52,10 @@ struct SwapchainData {
     VkDeviceMemory lumaBMemory = VK_NULL_HANDLE;
     VkImageView lumaBView = VK_NULL_HANDLE;
 
-    // Dummy coarse motion field (zeros)
     VkImage dummyCoarseImage = VK_NULL_HANDLE;
     VkDeviceMemory dummyCoarseMemory = VK_NULL_HANDLE;
     VkImageView dummyCoarseView = VK_NULL_HANDLE;
 
-    // Motion Vectors & Confidence Map
     VkImage motionImage = VK_NULL_HANDLE;
     VkDeviceMemory motionMemory = VK_NULL_HANDLE;
     VkImageView motionView = VK_NULL_HANDLE;
@@ -64,12 +64,10 @@ struct SwapchainData {
     VkDeviceMemory confidenceMemory = VK_NULL_HANDLE;
     VkImageView confidenceView = VK_NULL_HANDLE;
 
-    // Generated intermediate frame
     VkImage generatedImage = VK_NULL_HANDLE;
     VkDeviceMemory generatedMemory = VK_NULL_HANDLE;
     VkImageView generatedView = VK_NULL_HANDLE;
 
-    // Sampler & Descriptor Resources
     VkSampler linearSampler = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
 
@@ -77,7 +75,6 @@ struct SwapchainData {
     VkDescriptorSet flowDescSet = VK_NULL_HANDLE;
     VkDescriptorSet warpDescSet = VK_NULL_HANDLE;
 
-    // Timing metrics
     std::chrono::high_resolution_clock::time_point lastPresentTime;
     float smoothedFrametimeMs = 16.6f;
     uint32_t frameCounter = 0;
@@ -87,9 +84,15 @@ class Interceptor {
 public:
     static Interceptor& Get();
 
+    // Cache hardware info on device creation
+    void SetDeviceInfo(const VkPhysicalDeviceMemoryProperties& memProps, uint32_t queueFamily) {
+        m_cachedMemProps = memProps;
+        m_cachedQueueFamily = queueFamily;
+    }
+
+    // Standard 5-argument Vulkan swapchain creation hook
     VkResult OnCreateSwapchainKHR(
         VkDevice device,
-        const VkPhysicalDeviceMemoryProperties& memProperties,
         const VkSwapchainCreateInfoKHR* pCreateInfo,
         const VkAllocationCallbacks* pAllocator,
         VkSwapchainKHR* pSwapchain,
@@ -115,20 +118,12 @@ private:
 
     std::unordered_map<VkSwapchainKHR, std::unique_ptr<SwapchainData>> m_swapchains;
     ComputeEngine m_computeEngine;
+    bool m_computeEngineInitialized = false;
 
-    bool CreateTexture(
-        VkDevice device,
-        VkPhysicalDevice physicalDevice,
-        uint32_t width,
-        uint32_t height,
-        VkFormat format,
-        VkImageUsageFlags usage,
-        VkImage& outImage,
-        VkDeviceMemory& outMemory,
-        VkImageView& outView
-    );
+    VkPhysicalDeviceMemoryProperties m_cachedMemProps{};
+    uint32_t m_cachedQueueFamily = 0;
 
-    void AllocateFrameBuffers(SwapchainData& data);
+    bool AllocateFrameBuffers(SwapchainData& data);
     void CleanupSwapchainData(SwapchainData& data);
     void ComputeAdaptiveTiming(SwapchainData& data, float& outNormalizedT);
     void DispatchGenerationPass(SwapchainData& data, VkQueue queue, uint32_t imageIndex, float t);

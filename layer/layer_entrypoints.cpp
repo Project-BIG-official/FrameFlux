@@ -1,5 +1,5 @@
 // PB FrameFlux - LGPL-2.1
-// layer/layer_entrypoints.cpp: Crash-Safe Vulkan Loader Handshake
+// layer/layer_entrypoints.cpp: Robust Wine/DXVK/Native Vulkan Interceptor
 
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_layer.h>
@@ -16,6 +16,7 @@ namespace FrameFlux {
 
 static VkInstance g_instance = VK_NULL_HANDLE;
 static VkPhysicalDeviceMemoryProperties g_deviceMemoryProperties{};
+static uint32_t g_graphicsQueueFamilyIndex = 0;
 
 struct InstanceDispatch {
     PFN_vkGetInstanceProcAddr GetInstanceProcAddr = nullptr;
@@ -37,7 +38,6 @@ static InstanceDispatch g_globalInstanceDispatch{};
 static DeviceDispatch g_globalDeviceDispatch{};
 static std::mutex g_dispatchLock;
 
-// Safe dispatch key extractor (guaranteed no null dereference)
 template <typename DispatchableType>
 void* GetDispatchKey(DispatchableType inst) {
     if (!inst) return nullptr;
@@ -62,13 +62,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateSwapchainKHR(
         realFunc = (it != g_deviceDispatches.end() && it->second.CreateSwapchainKHR) ? it->second.CreateSwapchainKHR : g_globalDeviceDispatch.CreateSwapchainKHR;
     }
 
-    if (!realFunc) {
-        std::cerr << "[PB FrameFlux] ERROR: real CreateSwapchainKHR pointer is null!" << std::endl;
-        return VK_ERROR_INITIALIZATION_FAILED;
-    }
+    if (!realFunc) return VK_ERROR_INITIALIZATION_FAILED;
 
-    std::cout << "[PB FrameFlux Hook] vkCreateSwapchainKHR intercepted!" << std::endl;
-    return Interceptor::Get().OnCreateSwapchainKHR(device, g_deviceMemoryProperties, pCreateInfo, pAllocator, pSwapchain, realFunc);
+    // Clean 5-argument call matching standard Vulkan signature
+    return Interceptor::Get().OnCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain, realFunc);
 }
 
 static VKAPI_ATTR void VKAPI_CALL Hook_DestroySwapchainKHR(
@@ -81,7 +78,7 @@ static VKAPI_ATTR void VKAPI_CALL Hook_DestroySwapchainKHR(
         std::lock_guard<std::mutex> lock(g_dispatchLock);
         void* key = GetDispatchKey(device);
         auto it = g_deviceDispatches.find(key);
-        realFunc = (it != g_deviceDispatches.end() && it->second.DestroySwapchainKHR) ? it->second.DestroySwapchainKHR : g_globalDeviceDispatch.DestroySwapchainKHR;
+        realFunc = (it != g_deviceDispatches.end()) ? it->second.DestroySwapchainKHR : g_globalDeviceDispatch.DestroySwapchainKHR;
     }
 
     if (realFunc) {
@@ -98,13 +95,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(
         std::lock_guard<std::mutex> lock(g_dispatchLock);
         void* key = GetDispatchKey(queue);
         auto it = g_deviceDispatches.find(key);
-        realFunc = (it != g_deviceDispatches.end() && it->second.QueuePresentKHR) ? it->second.QueuePresentKHR : g_globalDeviceDispatch.QueuePresentKHR;
+        realFunc = (it != g_deviceDispatches.end()) ? it->second.QueuePresentKHR : g_globalDeviceDispatch.QueuePresentKHR;
     }
 
-    if (!realFunc) {
-        std::cerr << "[PB FrameFlux] ERROR: real QueuePresentKHR pointer is null!" << std::endl;
-        return VK_ERROR_INITIALIZATION_FAILED;
-    }
+    if (!realFunc) return VK_ERROR_INITIALIZATION_FAILED;
 
     return Interceptor::Get().OnQueuePresentKHR(queue, pPresentInfo, realFunc);
 }
@@ -131,7 +125,7 @@ static VKAPI_ATTR void VKAPI_CALL Hook_GetPhysicalDeviceMemoryProperties(
 
     if (realFunc) {
         realFunc(physicalDevice, pMemoryProperties);
-        g_deviceMemoryProperties = *pMemoryProperties; // Cache safely for allocator
+        g_deviceMemoryProperties = *pMemoryProperties;
     }
 }
 
@@ -140,8 +134,6 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateInstance(
     const VkAllocationCallbacks* pAllocator,
     VkInstance* pInstance
 ) {
-    std::cout << "[PB FrameFlux Hook] vkCreateInstance intercepted!" << std::endl;
-
     VkLayerInstanceCreateInfo* chainInfo = (VkLayerInstanceCreateInfo*)pCreateInfo->pNext;
     while (chainInfo && (chainInfo->sType != VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO ||
                          chainInfo->function != VK_LAYER_LINK_INFO)) {
@@ -180,7 +172,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
     const VkAllocationCallbacks* pAllocator,
     VkDevice* pDevice
 ) {
-    std::cout << "[PB FrameFlux Hook] vkCreateDevice intercepted!" << std::endl;
+    // Detect graphics queue family from DXVK's device request
+    if (pCreateInfo->queueCreateInfoCount > 0 && pCreateInfo->pQueueCreateInfos) {
+        g_graphicsQueueFamilyIndex = pCreateInfo->pQueueCreateInfos[0].queueFamilyIndex;
+    }
 
     VkLayerDeviceCreateInfo* chainInfo = (VkLayerDeviceCreateInfo*)pCreateInfo->pNext;
     while (chainInfo && (chainInfo->sType != VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO ||
@@ -202,6 +197,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
 
     VkResult res = realCreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
     if (res != VK_SUCCESS) return res;
+
+        Interceptor::Get().SetDeviceInfo(g_deviceMemoryProperties, g_graphicsQueueFamilyIndex);
 
     DeviceDispatch dispatch{};
     dispatch.GetDeviceProcAddr = nextGDPA;
@@ -285,10 +282,6 @@ VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL FrameFlux_GetInstancePr
 VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkNegotiateLoaderLayerInterfaceVersion(
     VkNegotiateLayerInterface* pVersionStruct
 ) {
-    std::cout << "\n===============================================" << std::endl;
-    std::cout << "[PB FrameFlux] Vulkan Loader Hooked Successfully!" << std::endl;
-    std::cout << "===============================================\n" << std::endl;
-
     if (pVersionStruct->loaderLayerInterfaceVersion < 2) {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
