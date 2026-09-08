@@ -9,10 +9,30 @@
 #include <vector>
 #include <memory>
 #include <chrono>
+#include <cstring>
+#include <strings.h>
+#include <cstdlib>
 
 #include "compute_engine.hpp"
 
 namespace FrameFlux {
+
+enum class FrameFluxMode {
+    Disabled,
+    LegacyV1, // Fast Frame Blending (v1.0, 0.05ms overhead, no optical flow)
+    TrueFGV2  // Motion-Compensated Optical Flow Warping (v2.0)
+};
+
+inline FrameFluxMode GetConfiguredMode() {
+    const char* env = std::getenv("ENABLE_FRAMEFLUX");
+    if (!env || std::strlen(env) == 0 || std::strcmp(env, "0") == 0) {
+        return FrameFluxMode::Disabled;
+    }
+    if (strcasecmp(env, "legacy") == 0 || std::strcmp(env, "1.0") == 0 || strcasecmp(env, "blend") == 0) {
+        return FrameFluxMode::LegacyV1;
+    }
+    return FrameFluxMode::TrueFGV2; // "1", "2.0", "true"
+}
 
 struct SwapchainData {
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
@@ -23,6 +43,7 @@ struct SwapchainData {
     VkExtent2D extent = {0, 0};
     std::vector<VkImage> realImages;
 
+    FrameFluxMode mode = FrameFluxMode::TrueFGV2;
     bool buffersAllocated = false;
 
     // Command resources
@@ -84,13 +105,11 @@ class Interceptor {
 public:
     static Interceptor& Get();
 
-    // Cache hardware info on device creation
     void SetDeviceInfo(const VkPhysicalDeviceMemoryProperties& memProps, uint32_t queueFamily) {
         m_cachedMemProps = memProps;
         m_cachedQueueFamily = queueFamily;
     }
 
-    // Standard 5-argument Vulkan swapchain creation hook
     VkResult OnCreateSwapchainKHR(
         VkDevice device,
         const VkSwapchainCreateInfoKHR* pCreateInfo,

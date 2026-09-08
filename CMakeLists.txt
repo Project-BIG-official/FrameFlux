@@ -67,6 +67,9 @@ set(SLANG_SHADERS
     "${SHADER_DIR}/warp_interpolate.slang"
     "${SHADER_DIR}/flow_search_dp4a.slang"
     "${SHADER_DIR}/luma_pack.slang"
+    "${SHADER_DIR}/flow_downsample.slang"
+    "${SHADER_DIR}/flow_refine_subgroup.slang"
+    "${SHADER_DIR}/fallback_blend.slang"
 )
 
 set(GENERATED_SPV_HEADERS "")
@@ -98,10 +101,19 @@ add_custom_target(FrameFluxShaders DEPENDS ${GENERATED_SPV_HEADERS})
 # -----------------------------------------------------------------------------
 # Build Layer Target
 # -----------------------------------------------------------------------------
+
 set(LAYER_SOURCES
     layer/layer_entrypoints.cpp
     layer/swapchain_interceptor.cpp
     layer/compute_engine.cpp
+    config/settings.cpp
+    runtime/scheduler/frametime_smoother.cpp
+    runtime/scheduler/display_timing.cpp
+    runtime/motion/compute_optical_flow.cpp
+    runtime/motion/nv_optical_flow.cpp
+    runtime/motion/game_vectors.cpp
+    runtime/interpolator/confidence_map.cpp
+    runtime/interpolator/frame_blender.cpp
 )
 
 set(LAYER_HEADERS
@@ -120,6 +132,11 @@ add_dependencies(VkLayer_projectbig_frameflux FrameFluxShaders)
 target_include_directories(VkLayer_projectbig_frameflux PRIVATE
     ${Vulkan_INCLUDE_DIRS}
     ${CMAKE_CURRENT_SOURCE_DIR}/layer
+    ${CMAKE_CURRENT_SOURCE_DIR}/config
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime/motion
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduler
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime/interpolator
     ${GENERATED_SHADER_HEADER_DIR}
 )
 

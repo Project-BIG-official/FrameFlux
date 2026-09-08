@@ -1,9 +1,9 @@
 // PB FrameFlux - LGPL-2.1
-// layer/compute_engine.cpp: Crash-Safe Slang Compute Dispatcher
+// layer/compute_engine.cpp: Slang Compute Engine Implementation
 
 #include "compute_engine.hpp"
+#include "settings.hpp"
 
-// Embedded Slang SPIR-V byte arrays
 #include "warp_interpolate_spv.hpp"
 #include "flow_search_dp4a_spv.hpp"
 #include "luma_pack_spv.hpp"
@@ -14,11 +14,9 @@
 
 namespace FrameFlux {
 
-// Safe helper to create VkShaderModule with guaranteed 4-byte memory alignment
 static VkShaderModule CreateShaderModule(VkDevice device, const uint8_t* byteCode, size_t codeSize) {
     if (!byteCode || codeSize == 0) return VK_NULL_HANDLE;
 
-    // Copy into 32-bit aligned buffer as strictly required by Vulkan VUID-VkShaderModuleCreateInfo-pCode-01379
     std::vector<uint32_t> alignedCode((codeSize + 3) / 4);
     std::memcpy(alignedCode.data(), byteCode, codeSize);
 
@@ -28,9 +26,7 @@ static VkShaderModule CreateShaderModule(VkDevice device, const uint8_t* byteCod
     smInfo.pCode = alignedCode.data();
 
     VkShaderModule module = VK_NULL_HANDLE;
-    VkResult res = vkCreateShaderModule(device, &smInfo, nullptr, &module);
-    if (res != VK_SUCCESS) {
-        std::cerr << "[PB FrameFlux] vkCreateShaderModule failed! Error: " << res << std::endl;
+    if (vkCreateShaderModule(device, &smInfo, nullptr, &module) != VK_SUCCESS) {
         return VK_NULL_HANDLE;
     }
     return module;
@@ -60,9 +56,6 @@ void ComputeEngine::Cleanup() {
     destroyPipe(m_warpPipeline, m_warpPipeLayout, m_warpDescLayout, m_warpShader);
 }
 
-// -----------------------------------------------------------------------------
-// 1. Luma Pack Pipeline
-// -----------------------------------------------------------------------------
 bool ComputeEngine::CreateLumaPipeline() {
     m_lumaShader = CreateShaderModule(m_device, luma_pack_spv, luma_pack_spv_size);
     if (m_lumaShader == VK_NULL_HANDLE) return false;
@@ -94,7 +87,7 @@ bool ComputeEngine::CreateLumaPipeline() {
     stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     stageInfo.module = m_lumaShader;
-    stageInfo.pName = "main"; // Slang SPIR-V OpEntryPoint is strictly "main"
+    stageInfo.pName = "main";
     stageInfo.pSpecializationInfo = nullptr;
 
     VkComputePipelineCreateInfo pipeInfo{};
@@ -103,27 +96,19 @@ bool ComputeEngine::CreateLumaPipeline() {
     pipeInfo.layout = m_lumaPipeLayout;
     pipeInfo.basePipelineIndex = -1;
 
-    VkResult res = vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_lumaPipeline);
-    if (res != VK_SUCCESS) {
-        std::cerr << "[PB FrameFlux] Failed to create Luma compute pipeline! Res: " << res << std::endl;
-        return false;
-    }
-    return true;
+    return vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_lumaPipeline) == VK_SUCCESS;
 }
 
-// -----------------------------------------------------------------------------
-// 2. Optical Flow Search DP4A Pipeline
-// -----------------------------------------------------------------------------
 bool ComputeEngine::CreateFlowPipeline() {
     m_flowShader = CreateShaderModule(m_device, flow_search_dp4a_spv, flow_search_dp4a_spv_size);
     if (m_flowShader == VK_NULL_HANDLE) return false;
 
     std::vector<VkDescriptorSetLayoutBinding> bindings = {
-        {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}, // lumaPackedA
-        {1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}, // lumaPackedB
-        {2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}, // coarseMotionField
-        {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}, // outMotionVectors
-        {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}  // outConfidenceMap
+        {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}
     };
     VkDescriptorSetLayoutCreateInfo dlInfo{};
     dlInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
@@ -148,7 +133,7 @@ bool ComputeEngine::CreateFlowPipeline() {
     stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     stageInfo.module = m_flowShader;
-    stageInfo.pName = "main"; // Slang SPIR-V OpEntryPoint is strictly "main"
+    stageInfo.pName = "main";
     stageInfo.pSpecializationInfo = nullptr;
 
     VkComputePipelineCreateInfo pipeInfo{};
@@ -157,17 +142,9 @@ bool ComputeEngine::CreateFlowPipeline() {
     pipeInfo.layout = m_flowPipeLayout;
     pipeInfo.basePipelineIndex = -1;
 
-    VkResult res = vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_flowPipeline);
-    if (res != VK_SUCCESS) {
-        std::cerr << "[PB FrameFlux] Failed to create Flow compute pipeline! Res: " << res << std::endl;
-        return false;
-    }
-    return true;
+    return vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_flowPipeline) == VK_SUCCESS;
 }
 
-// -----------------------------------------------------------------------------
-// 3. Warp & Interpolation Pipeline
-// -----------------------------------------------------------------------------
 bool ComputeEngine::CreateWarpPipeline() {
     m_warpShader = CreateShaderModule(m_device, warp_interpolate_spv, warp_interpolate_spv_size);
     if (m_warpShader == VK_NULL_HANDLE) return false;
@@ -203,7 +180,7 @@ bool ComputeEngine::CreateWarpPipeline() {
     stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     stageInfo.module = m_warpShader;
-    stageInfo.pName = "main"; // Slang SPIR-V OpEntryPoint is strictly "main"
+    stageInfo.pName = "main";
     stageInfo.pSpecializationInfo = nullptr;
 
     VkComputePipelineCreateInfo pipeInfo{};
@@ -212,12 +189,7 @@ bool ComputeEngine::CreateWarpPipeline() {
     pipeInfo.layout = m_warpPipeLayout;
     pipeInfo.basePipelineIndex = -1;
 
-    VkResult res = vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_warpPipeline);
-    if (res != VK_SUCCESS) {
-        std::cerr << "[PB FrameFlux] Failed to create Warp compute pipeline! Res: " << res << std::endl;
-        return false;
-    }
-    return true;
+    return vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_warpPipeline) == VK_SUCCESS;
 }
 
 void ComputeEngine::RecordLumaPass(VkCommandBuffer cmd, VkDescriptorSet descSet, uint32_t width, uint32_t height) {
@@ -225,15 +197,21 @@ void ComputeEngine::RecordLumaPass(VkCommandBuffer cmd, VkDescriptorSet descSet,
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_lumaPipeLayout, 0, 1, &descSet, 0, nullptr);
     LumaPushConstants pc{width, height};
     vkCmdPushConstants(cmd, m_lumaPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(LumaPushConstants), &pc);
-    vkCmdDispatch(cmd, ((width / 4) + 15) / 16, (height + 15) / 16, 1);
+    uint32_t packedW = (width + 3) / 4;
+    vkCmdDispatch(cmd, (packedW + 15) / 16, (height + 15) / 16, 1);
 }
 
 void ComputeEngine::RecordFlowPass(VkCommandBuffer cmd, VkDescriptorSet descSet, uint32_t width, uint32_t height) {
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_flowPipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_flowPipeLayout, 0, 1, &descSet, 0, nullptr);
-    FlowPushConstants pc{(width / 4 + 3) / 4, (height + 3) / 4, width, height, 1.0f};
+    uint32_t gridX = (width + 3) / 4;
+    uint32_t gridY = (height + 3) / 4;
+    
+    uint32_t stride = (ConfigManager::Get().GetConfig().searchMode == "high") ? 3 : 1;
+    FlowPushConstants pc{gridX, gridY, width, height, stride, 1.0f};
+
     vkCmdPushConstants(cmd, m_flowPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(FlowPushConstants), &pc);
-    vkCmdDispatch(cmd, pc.blockGridDimX, pc.blockGridDimY, 1);
+    vkCmdDispatch(cmd, gridX, gridY, 1);
 }
 
 void ComputeEngine::RecordWarpPass(VkCommandBuffer cmd, VkDescriptorSet descSet, const WarpPushConstants& pc, uint32_t width, uint32_t height) {

@@ -1,9 +1,12 @@
 // PB FrameFlux - LGPL-2.1
-// layer/swapchain_interceptor.cpp: Safe Unity/DXVK Swapchain Interception
+// layer/swapchain_interceptor.cpp: Decoupled Multiplier Frame Generation Engine
 
 #include "swapchain_interceptor.hpp"
+#include "settings.hpp"
+
 #include <algorithm>
 #include <iostream>
+#include <thread>
 
 namespace FrameFlux {
 
@@ -47,6 +50,21 @@ static void TransitionImage(
     vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 }
 
+static void PreciseDelay(uint32_t microseconds) {
+    auto start = std::chrono::high_resolution_clock::now();
+    auto target = start + std::chrono::microseconds(microseconds);
+
+    if (microseconds > 2000) {
+        std::this_thread::sleep_for(std::chrono::microseconds(microseconds - 1500));
+    }
+
+    while (std::chrono::high_resolution_clock::now() < target) {
+        #if defined(__x86_64__) || defined(_M_X64)
+        __builtin_ia32_pause();
+        #endif
+    }
+}
+
 Interceptor& Interceptor::Get() {
     static Interceptor instance;
     return instance;
@@ -56,10 +74,10 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
     uint32_t w = data.extent.width;
     uint32_t h = data.extent.height;
 
-    // Safety guard against 0x0 extent window initialization in Unity
     if (w == 0 || h == 0) return false;
 
     uint32_t packedW = (w + 3) / 4;
+    uint32_t blockGridH = (h + 3) / 4;
 
     auto allocTex = [&](uint32_t width, uint32_t height, VkFormat format, VkImageUsageFlags usage,
                         VkImage& outImg, VkDeviceMemory& outMem, VkImageView& outView) -> bool {
@@ -101,21 +119,23 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
         return vkCreateImageView(data.device, &viewInfo, nullptr, &outView) == VK_SUCCESS;
     };
 
-    VkImageUsageFlags sampledUsage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-    if (!allocTex(w, h, data.imageFormat, sampledUsage, data.frameAImage, data.frameAMemory, data.frameAView)) return false;
-    if (!allocTex(w, h, data.imageFormat, sampledUsage, data.frameBImage, data.frameBMemory, data.frameBView)) return false;
+    VkFormat workingFormat = data.imageFormat;
+    if (workingFormat == VK_FORMAT_B8G8R8A8_SRGB) workingFormat = VK_FORMAT_B8G8R8A8_UNORM;
+    if (workingFormat == VK_FORMAT_R8G8B8A8_SRGB) workingFormat = VK_FORMAT_R8G8B8A8_UNORM;
 
-    // Generated image uses standard format matching swapchain
-    VkFormat genFormat = (data.imageFormat == VK_FORMAT_B8G8R8A8_SRGB) ? VK_FORMAT_B8G8R8A8_UNORM : data.imageFormat;
+    VkImageUsageFlags sampledUsage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    if (!allocTex(w, h, workingFormat, sampledUsage, data.frameAImage, data.frameAMemory, data.frameAView)) return false;
+    if (!allocTex(w, h, workingFormat, sampledUsage, data.frameBImage, data.frameBMemory, data.frameBView)) return false;
+
     VkImageUsageFlags storageUsage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-    if (!allocTex(w, h, genFormat, storageUsage, data.generatedImage, data.generatedMemory, data.generatedView)) return false;
+    if (!allocTex(w, h, workingFormat, storageUsage, data.generatedImage, data.generatedMemory, data.generatedView)) return false;
 
     if (!allocTex(packedW, h, VK_FORMAT_R32_UINT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, data.lumaAImage, data.lumaAMemory, data.lumaAView)) return false;
     if (!allocTex(packedW, h, VK_FORMAT_R32_UINT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, data.lumaBImage, data.lumaBMemory, data.lumaBView)) return false;
 
     if (!allocTex(1, 1, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, data.dummyCoarseImage, data.dummyCoarseMemory, data.dummyCoarseView)) return false;
-    if (!allocTex(w, h, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT, data.motionImage, data.motionMemory, data.motionView)) return false;
-    if (!allocTex(w, h, VK_FORMAT_R8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT, data.confidenceImage, data.confidenceMemory, data.confidenceView)) return false;
+    if (!allocTex(packedW, blockGridH, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT, data.motionImage, data.motionMemory, data.motionView)) return false;
+    if (!allocTex(packedW, blockGridH, VK_FORMAT_R8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT, data.confidenceImage, data.confidenceMemory, data.confidenceView)) return false;
 
     VkSamplerCreateInfo samplerInfo{};
     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -249,8 +269,13 @@ VkResult Interceptor::OnCreateSwapchainKHR(
     VkSwapchainKHR* pSwapchain,
     PFN_vkCreateSwapchainKHR realFunc
 ) {
+    ConfigManager::Get().LoadOrCreate();
+    const auto& cfg = ConfigManager::Get().GetConfig();
+
+    uint32_t multiplier = cfg.multiplier;
+
     VkSwapchainCreateInfoKHR modifiedCreateInfo = *pCreateInfo;
-    modifiedCreateInfo.minImageCount = std::max(pCreateInfo->minImageCount + 2, 4u);
+    modifiedCreateInfo.minImageCount = std::max(pCreateInfo->minImageCount + multiplier, 6u);
 
     VkResult result = realFunc(device, &modifiedCreateInfo, pAllocator, pSwapchain);
     if (result != VK_SUCCESS) {
@@ -271,6 +296,7 @@ VkResult Interceptor::OnCreateSwapchainKHR(
     data->imageFormat = pCreateInfo->imageFormat;
     data->extent = pCreateInfo->imageExtent;
     data->lastPresentTime = std::chrono::high_resolution_clock::now();
+    data->mode = (cfg.mode == "v1") ? FrameFluxMode::LegacyV1 : FrameFluxMode::TrueFGV2;
 
     uint32_t imageCount = 0;
     vkGetSwapchainImagesKHR(device, *pSwapchain, &imageCount, nullptr);
@@ -330,15 +356,15 @@ void Interceptor::OnDestroySwapchainKHR(
 
 void Interceptor::ComputeAdaptiveTiming(SwapchainData& data, float& outNormalizedT) {
     auto now = std::chrono::high_resolution_clock::now();
-    float rawDeltaMs = std::chrono::duration<float, std::milli>(now - data.lastPresentTime).count();
-    data.lastPresentTime = now;
+    float pureGameRenderMs = std::chrono::duration<float, std::milli>(now - data.lastPresentTime).count();
+    pureGameRenderMs = std::clamp(pureGameRenderMs, 2.0f, 100.0f);
 
-    constexpr float alpha = 0.15f;
-    data.smoothedFrametimeMs = alpha * rawDeltaMs + (1.0f - alpha) * data.smoothedFrametimeMs;
+    constexpr float alpha = 0.12f;
+    data.smoothedFrametimeMs = alpha * pureGameRenderMs + (1.0f - alpha) * data.smoothedFrametimeMs;
     outNormalizedT = 0.5f;
 }
 
-void Interceptor::DispatchGenerationPass(SwapchainData& data, VkQueue queue, uint32_t imageIndex, float t) {
+static void IngestAndComputeFlow(SwapchainData& data, VkQueue queue, uint32_t imageIndex, ComputeEngine& computeEngine) {
     VkCommandBuffer cmd = data.genCommandBuffer;
     vkResetCommandBuffer(cmd, 0);
 
@@ -363,73 +389,147 @@ void Interceptor::DispatchGenerationPass(SwapchainData& data, VkQueue queue, uin
     vkCmdCopyImage(cmd, data.realImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                    data.frameBImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &fullCopyRegion);
 
-    TransitionImage(cmd, data.frameBImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    if (data.mode == FrameFluxMode::TrueFGV2) {
+        TransitionImage(cmd, data.frameBImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+        TransitionImage(cmd, data.lumaBImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_WRITE_BIT);
+        computeEngine.RecordLumaPass(cmd, data.lumaDescSet, w, h);
+
+        TransitionImage(cmd, data.lumaBImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+        TransitionImage(cmd, data.lumaAImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+        TransitionImage(cmd, data.dummyCoarseImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_READ_BIT);
+        TransitionImage(cmd, data.motionImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_WRITE_BIT);
+        TransitionImage(cmd, data.confidenceImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_WRITE_BIT);
+        computeEngine.RecordFlowPass(cmd, data.flowDescSet, w, h);
+
+        TransitionImage(cmd, data.motionImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+        TransitionImage(cmd, data.confidenceImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    } else {
+        TransitionImage(cmd, data.frameBImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    }
+
+    TransitionImage(cmd, data.frameAImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
-    TransitionImage(cmd, data.lumaBImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_WRITE_BIT);
-    m_computeEngine.RecordLumaPass(cmd, data.lumaDescSet, w, h);
 
-    TransitionImage(cmd, data.lumaBImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
-    TransitionImage(cmd, data.lumaAImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_READ_BIT);
-    TransitionImage(cmd, data.dummyCoarseImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_READ_BIT);
-    TransitionImage(cmd, data.motionImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_WRITE_BIT);
-    TransitionImage(cmd, data.confidenceImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_WRITE_BIT);
-    m_computeEngine.RecordFlowPass(cmd, data.flowDescSet, w, h);
+    vkEndCommandBuffer(cmd);
 
-    TransitionImage(cmd, data.motionImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
-    TransitionImage(cmd, data.confidenceImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
-    TransitionImage(cmd, data.frameAImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_READ_BIT);
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &cmd;
+    vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(queue);
+}
+
+// -----------------------------------------------------------------------------
+// Phase 3: Synthesize and Blit intermediate frame G_k (Non-recursive!)
+// -----------------------------------------------------------------------------
+static void GenerateAndBlitIntermediate(SwapchainData& data, VkQueue queue, uint32_t targetImageIndex, float t, ComputeEngine& computeEngine) {
+    VkCommandBuffer cmd = data.genCommandBuffer;
+    vkResetCommandBuffer(cmd, 0);
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &beginInfo);
+
+    uint32_t w = data.extent.width;
+    uint32_t h = data.extent.height;
+
+    VkImageCopy fullCopyRegion{};
+    fullCopyRegion.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    fullCopyRegion.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    fullCopyRegion.extent = {w, h, 1};
+
     TransitionImage(cmd, data.generatedImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_WRITE_BIT);
 
+    // Читаем настройки из SettingsManager
+    const auto& cfg = SettingsManager::Get().GetSettings();
+    uint32_t fallbackAct = 1; // Default: Blend
+    if (cfg.fallbackAction == "repeat") fallbackAct = 0;
+    else if (cfg.fallbackAction == "drop") fallbackAct = 2; // Instant VRR drop
+
+    // Warp evaluated directly from pristine Anchor A and Anchor B
     WarpPushConstants pc{};
     pc.t = t;
-    pc.confidenceThreshold = 2.0f; // Stable blend
-    pc.fallbackAction = 1;
-    pc.searchMode = 1;
+    pc.confidenceThreshold = (data.mode == FrameFluxMode::LegacyV1) ? 2.0f : 0.65f;
+    pc.fallbackAction = fallbackAct;
+    pc.showDebugWatermark = cfg.showWatermark ? 1 : 0;
     pc.resolutionX = w;
     pc.resolutionY = h;
     pc.invResolutionX = 1.0f / static_cast<float>(w);
     pc.invResolutionY = 1.0f / static_cast<float>(h);
-    m_computeEngine.RecordWarpPass(cmd, data.warpDescSet, pc, w, h);
+    computeEngine.RecordWarpPass(cmd, data.warpDescSet, pc, w, h);
 
+    // Output to target swapchain buffer
     TransitionImage(cmd, data.generatedImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-    TransitionImage(cmd, data.realImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    TransitionImage(cmd, data.realImages[targetImageIndex], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
 
     vkCmdCopyImage(cmd, data.generatedImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                   data.realImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &fullCopyRegion);
+                   data.realImages[targetImageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &fullCopyRegion);
 
-    TransitionImage(cmd, data.realImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+    TransitionImage(cmd, data.realImages[targetImageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, 0);
+
+    vkEndCommandBuffer(cmd);
+
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &cmd;
+    vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(queue);
+}
+
+static void CommitHistoryAdvance(SwapchainData& data, VkQueue queue) {
+    VkCommandBuffer cmd = data.genCommandBuffer;
+    vkResetCommandBuffer(cmd, 0);
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &beginInfo);
+
+    uint32_t w = data.extent.width;
+    uint32_t h = data.extent.height;
+
+    VkImageCopy fullCopyRegion{};
+    fullCopyRegion.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    fullCopyRegion.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    fullCopyRegion.extent = {w, h, 1};
 
     TransitionImage(cmd, data.frameBImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
     TransitionImage(cmd, data.frameAImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
     vkCmdCopyImage(cmd, data.frameBImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                    data.frameAImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &fullCopyRegion);
 
-    VkImageCopy lumaCopyRegion{};
-    lumaCopyRegion.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    lumaCopyRegion.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    lumaCopyRegion.extent = {(w + 3) / 4, h, 1};
+    if (data.mode == FrameFluxMode::TrueFGV2) {
+        VkImageCopy lumaCopyRegion{};
+        lumaCopyRegion.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        lumaCopyRegion.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        lumaCopyRegion.extent = {(w + 3) / 4, h, 1};
 
-    TransitionImage(cmd, data.lumaBImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-    TransitionImage(cmd, data.lumaAImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
-    vkCmdCopyImage(cmd, data.lumaBImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                   data.lumaAImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &lumaCopyRegion);
+        TransitionImage(cmd, data.lumaBImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        TransitionImage(cmd, data.lumaAImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        vkCmdCopyImage(cmd, data.lumaBImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       data.lumaAImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &lumaCopyRegion);
+    }
 
     vkEndCommandBuffer(cmd);
 
@@ -466,6 +566,8 @@ void Interceptor::PresentRealFrame(SwapchainData& data, VkQueue queue, uint32_t 
     vkCmdCopyImage(cmd, data.frameBImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                    data.realImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
 
+    TransitionImage(cmd, data.frameBImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT);
     TransitionImage(cmd, data.realImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, 0);
 
@@ -495,44 +597,106 @@ VkResult Interceptor::OnQueuePresentKHR(
         if (it != m_swapchains.end()) {
             SwapchainData& data = *(it->second);
 
-            // If buffers are not ready yet (0x0 extent initialization), pass through safely
             if (!data.buffersAllocated) {
+                return realFunc(queue, pPresentInfo);
+            }
+
+            const auto& cfg = ConfigManager::Get().GetConfig();
+            if (cfg.mode == "off") {
                 return realFunc(queue, pPresentInfo);
             }
 
             data.frameCounter++;
 
-            if (data.frameCounter > 2) {
-                float t = 0.5f;
-                ComputeAdaptiveTiming(data, t);
+            if (data.frameCounter <= 2) {
+                VkCommandBuffer cmd = data.genCommandBuffer;
+                vkResetCommandBuffer(cmd, 0);
+                VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+                vkBeginCommandBuffer(cmd, &beginInfo);
 
-                DispatchGenerationPass(data, queue, pPresentInfo->pImageIndices[i], t);
+                TransitionImage(cmd, data.frameAImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+                TransitionImage(cmd, data.lumaAImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
 
-                VkPresentInfoKHR presentG = *pPresentInfo;
-                presentG.swapchainCount = 1;
-                presentG.pSwapchains = &data.swapchain;
-                presentG.pImageIndices = &pPresentInfo->pImageIndices[i];
-                realFunc(queue, &presentG);
+                vkEndCommandBuffer(cmd);
+                VkSubmitInfo sub{VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &cmd, 0, nullptr};
+                vkQueueSubmit(queue, 1, &sub, VK_NULL_HANDLE);
+                vkQueueWaitIdle(queue);
 
-                uint32_t secondImageIndex = 0;
-                VkResult acqRes = vkAcquireNextImageKHR(
+                data.lastPresentTime = std::chrono::high_resolution_clock::now();
+                return realFunc(queue, pPresentInfo);
+            }
+
+            uint32_t multiplier = cfg.multiplier;
+            float t = 0.5f;
+            ComputeAdaptiveTiming(data, t);
+
+            uint32_t intervalUs = 0;
+            if (cfg.targetFps > 0) {
+                intervalUs = 1000000u / cfg.targetFps;
+            } else {
+                intervalUs = static_cast<uint32_t>((data.smoothedFrametimeMs * 1000.0f) / multiplier);
+            }
+            intervalUs = std::clamp(intervalUs, 2000u, 30000u);
+
+            IngestAndComputeFlow(data, queue, pPresentInfo->pImageIndices[i], m_computeEngine);
+
+            float stepT = 1.0f / static_cast<float>(multiplier);
+
+            GenerateAndBlitIntermediate(data, queue, pPresentInfo->pImageIndices[i], stepT, m_computeEngine);
+
+            VkPresentInfoKHR presentG = *pPresentInfo;
+            presentG.swapchainCount = 1;
+            presentG.pSwapchains = &data.swapchain;
+            presentG.pImageIndices = &pPresentInfo->pImageIndices[i];
+            realFunc(queue, &presentG);
+
+            PreciseDelay(intervalUs);
+
+            for (uint32_t m = 2; m < multiplier; ++m) {
+                float intermediateT = stepT * m;
+                uint32_t midImageIndex = 0;
+                VkResult midRes = vkAcquireNextImageKHR(
                     data.device, data.swapchain, 50000000ULL,
-                    data.internalAcquireSemaphore, VK_NULL_HANDLE, &secondImageIndex
+                    data.internalAcquireSemaphore, VK_NULL_HANDLE, &midImageIndex
                 );
 
-                if ((acqRes == VK_SUCCESS || acqRes == VK_SUBOPTIMAL_KHR) && secondImageIndex < data.realImages.size()) {
-                    PresentRealFrame(data, queue, secondImageIndex);
+                if ((midRes == VK_SUCCESS || midRes == VK_SUBOPTIMAL_KHR) && midImageIndex < data.realImages.size()) {
+                    GenerateAndBlitIntermediate(data, queue, midImageIndex, intermediateT, m_computeEngine);
 
-                    VkPresentInfoKHR presentB{};
-                    presentB.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-                    presentB.swapchainCount = 1;
-                    presentB.pSwapchains = &data.swapchain;
-                    presentB.pImageIndices = &secondImageIndex;
-                    return realFunc(queue, &presentB);
+                    VkPresentInfoKHR presentMid{};
+                    presentMid.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+                    presentMid.swapchainCount = 1;
+                    presentMid.pSwapchains = &data.swapchain;
+                    presentMid.pImageIndices = &midImageIndex;
+                    realFunc(queue, &presentMid);
+
+                    PreciseDelay(intervalUs);
                 }
-
-                return VK_SUCCESS;
             }
+
+            uint32_t secondImageIndex = 0;
+            VkResult acqRes = vkAcquireNextImageKHR(
+                data.device, data.swapchain, 50000000ULL,
+                data.internalAcquireSemaphore, VK_NULL_HANDLE, &secondImageIndex
+            );
+
+            if ((acqRes == VK_SUCCESS || acqRes == VK_SUBOPTIMAL_KHR) && secondImageIndex < data.realImages.size()) {
+                PresentRealFrame(data, queue, secondImageIndex);
+
+                VkPresentInfoKHR presentB{};
+                presentB.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+                presentB.swapchainCount = 1;
+                presentB.pSwapchains = &data.swapchain;
+                presentB.pImageIndices = &secondImageIndex;
+                realFunc(queue, &presentB);
+            }
+
+            CommitHistoryAdvance(data, queue);
+
+            data.lastPresentTime = std::chrono::high_resolution_clock::now();
+            return VK_SUCCESS;
         }
     }
 
