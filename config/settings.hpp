@@ -1,22 +1,24 @@
 // PB FrameFlux - LGPL-2.1
-// config/settings.hpp: Complete Configuration System & Backward-Compatible Aliases
+// config/settings.hpp: Complete Configuration System & Live Persistence
 
 #pragma once
 
 #include <string>
 #include <cstdint>
+#include <filesystem>
 
 namespace FrameFlux {
 
 struct AppSettings {
-    std::string mode = "v2";              // "v2" (True FG), "v1" (Legacy Blend), "off"
-    std::string profile = "quality";      // "quality" (Pyramid Refinement), "performance" (Fast Single-Pass)
-    uint32_t multiplier = 2;              // 2, 3, 4, 5, 6
-    std::string schedulerMode = "auto";   // "auto" (VBlank sync), "fixed" (strict pace), "target_fps"
-    uint32_t targetFps = 0;               // >0 = Target FPS lock (e.g. 120, 144, 165)
-    std::string searchMode = "high";      // "high" (+-24px wide motion), "standard" (+-8px)
-    std::string fallbackAction = "blend"; // "blend", "repeat", "drop" (instant VRR bypass)
-    bool showWatermark = false;           // Neon-green debug square
+    std::string mode = "v2";              // "v2", "v1", "off"
+    std::string profile = "quality";      // "quality", "performance"
+    uint32_t multiplier = 2;              // 2..6
+    std::string schedulerMode = "auto";   // "auto", "fixed", "target_fps"
+    uint32_t targetFps = 0;               // 0 = off, or 60, 120, 144, 165, 240
+    std::string searchMode = "high";      // "high", "standard"
+    std::string fallbackAction = "blend"; // "blend", "repeat", "drop"
+    bool showWatermark = false;           // Telemetry HUD visible
+    uint32_t hudCorner = 0;               // 0 = Top-Left, 1 = Top-Right, 2 = Bottom-Left, 3 = Bottom-Right
 };
 
 using FrameFluxConfig = AppSettings;
@@ -26,19 +28,23 @@ public:
     static SettingsManager& Get();
 
     const AppSettings& GetSettings() const { return m_settings; }
-    const AppSettings& GetConfig() const { return m_settings; } // Backward-compatible alias
+    AppSettings& GetMutableSettings() { return m_settings; }
+    const AppSettings& GetConfig() const { return m_settings; }
 
     void LoadOrCreate();
+    void CheckHotReload();
+    void SaveToFile(); // Persists live in-game changes into frameflux.ini
 
 private:
     AppSettings m_settings;
+    std::filesystem::file_time_type m_lastConfigWriteTime{};
+    std::string m_activeConfigPath = "frameflux.ini";
 
     SettingsManager() = default;
     void SyncAndLoadFile(const std::string& path);
     void ApplyEnvironmentOverrides();
 };
 
-// Aliases: both ConfigManager::Get() and SettingsManager::Get() are 100% valid!
 using ConfigManager = SettingsManager;
 
 } // namespace FrameFlux

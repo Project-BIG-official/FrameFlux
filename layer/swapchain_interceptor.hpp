@@ -1,5 +1,5 @@
 // PB FrameFlux - LGPL-2.1
-// layer/swapchain_interceptor.hpp: Clean Decoupled Swapchain Interceptor
+// layer/swapchain_interceptor.hpp: Complete Unified Swapchain Header
 
 #pragma once
 
@@ -9,30 +9,19 @@
 #include <vector>
 #include <memory>
 #include <chrono>
-#include <cstring>
-#include <strings.h>
-#include <cstdlib>
 
 #include "compute_engine.hpp"
+#include "settings.hpp"
+#include "frametime_smoother.hpp"
+#include "vulkan_extensions.hpp"
 
 namespace FrameFlux {
 
 enum class FrameFluxMode {
     Disabled,
-    LegacyV1, // Fast Frame Blending (v1.0, 0.05ms overhead, no optical flow)
-    TrueFGV2  // Motion-Compensated Optical Flow Warping (v2.0)
+    LegacyV1, // v1.0 Fast Blend (0.05ms)
+    TrueFGV2  // v2.0 True Optical Flow FG
 };
-
-inline FrameFluxMode GetConfiguredMode() {
-    const char* env = std::getenv("ENABLE_FRAMEFLUX");
-    if (!env || std::strlen(env) == 0 || std::strcmp(env, "0") == 0) {
-        return FrameFluxMode::Disabled;
-    }
-    if (strcasecmp(env, "legacy") == 0 || std::strcmp(env, "1.0") == 0 || strcasecmp(env, "blend") == 0) {
-        return FrameFluxMode::LegacyV1;
-    }
-    return FrameFluxMode::TrueFGV2; // "1", "2.0", "true"
-}
 
 struct SwapchainData {
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
@@ -43,20 +32,23 @@ struct SwapchainData {
     VkExtent2D extent = {0, 0};
     std::vector<VkImage> realImages;
 
-    FrameFluxMode mode = FrameFluxMode::TrueFGV2;
     bool buffersAllocated = false;
+    FrameFluxMode mode = FrameFluxMode::TrueFGV2;
+    FrametimeSmoother smoother;
 
     // Command resources
     VkCommandPool commandPool = VK_NULL_HANDLE;
     VkCommandBuffer genCommandBuffer = VK_NULL_HANDLE;
     VkCommandBuffer realCommandBuffer = VK_NULL_HANDLE;
 
-    // Synchronization
+    // Synchronization Semaphores
     VkSemaphore timelineSemaphore = VK_NULL_HANDLE;
     VkSemaphore internalAcquireSemaphore = VK_NULL_HANDLE;
-    uint64_t currentTimelineValue = 0;
+    VkSemaphore realDoneSemaphore = VK_NULL_HANDLE;
+    std::vector<VkSemaphore> acquireSemaphores;
+    std::vector<VkSemaphore> genDoneSemaphores;
 
-    // Intermediate frame textures
+    // Full-Res RGBA Frame history
     VkImage frameAImage = VK_NULL_HANDLE;
     VkDeviceMemory frameAMemory = VK_NULL_HANDLE;
     VkImageView frameAView = VK_NULL_HANDLE;
@@ -65,6 +57,7 @@ struct SwapchainData {
     VkDeviceMemory frameBMemory = VK_NULL_HANDLE;
     VkImageView frameBView = VK_NULL_HANDLE;
 
+    // Full-Res Luma textures
     VkImage lumaAImage = VK_NULL_HANDLE;
     VkDeviceMemory lumaAMemory = VK_NULL_HANDLE;
     VkImageView lumaAView = VK_NULL_HANDLE;
@@ -73,9 +66,23 @@ struct SwapchainData {
     VkDeviceMemory lumaBMemory = VK_NULL_HANDLE;
     VkImageView lumaBView = VK_NULL_HANDLE;
 
+    // Half-Res Pyramid Luma textures (for Quality 2-Pass Refinement)
+    VkImage lumaAHalfImage = VK_NULL_HANDLE;
+    VkDeviceMemory lumaAHalfMemory = VK_NULL_HANDLE;
+    VkImageView lumaAHalfView = VK_NULL_HANDLE;
+
+    VkImage lumaBHalfImage = VK_NULL_HANDLE;
+    VkDeviceMemory lumaBHalfMemory = VK_NULL_HANDLE;
+    VkImageView lumaBHalfView = VK_NULL_HANDLE;
+
+    // Motion & Confidence Textures
     VkImage dummyCoarseImage = VK_NULL_HANDLE;
     VkDeviceMemory dummyCoarseMemory = VK_NULL_HANDLE;
     VkImageView dummyCoarseView = VK_NULL_HANDLE;
+
+    VkImage coarseMotionImage = VK_NULL_HANDLE;
+    VkDeviceMemory coarseMotionMemory = VK_NULL_HANDLE;
+    VkImageView coarseMotionView = VK_NULL_HANDLE;
 
     VkImage motionImage = VK_NULL_HANDLE;
     VkDeviceMemory motionMemory = VK_NULL_HANDLE;
@@ -85,20 +92,32 @@ struct SwapchainData {
     VkDeviceMemory confidenceMemory = VK_NULL_HANDLE;
     VkImageView confidenceView = VK_NULL_HANDLE;
 
+    // Output Generated Frame
     VkImage generatedImage = VK_NULL_HANDLE;
     VkDeviceMemory generatedMemory = VK_NULL_HANDLE;
     VkImageView generatedView = VK_NULL_HANDLE;
 
+    VkDescriptorSet overlayDescSet = VK_NULL_HANDLE;
+
+    // Sampler & Descriptor Pools
     VkSampler linearSampler = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
 
     VkDescriptorSet lumaDescSet = VK_NULL_HANDLE;
-    VkDescriptorSet flowDescSet = VK_NULL_HANDLE;
+    VkDescriptorSet downsampleDescSet = VK_NULL_HANDLE;
+    VkDescriptorSet coarseFlowDescSet = VK_NULL_HANDLE;
+    VkDescriptorSet refineDescSet = VK_NULL_HANDLE;
+    VkDescriptorSet directFlowDescSet = VK_NULL_HANDLE;
     VkDescriptorSet warpDescSet = VK_NULL_HANDLE;
 
+    // Timing metrics
     std::chrono::high_resolution_clock::time_point lastPresentTime;
     float smoothedFrametimeMs = 16.6f;
     uint32_t frameCounter = 0;
+
+    uint32_t totalAllocatedVramMb = 0;
+    float lastCpuTimeMs = 0.03f;
+    std::chrono::high_resolution_clock::time_point presentStartTime;
 };
 
 class Interceptor {
@@ -145,8 +164,6 @@ private:
     bool AllocateFrameBuffers(SwapchainData& data);
     void CleanupSwapchainData(SwapchainData& data);
     void ComputeAdaptiveTiming(SwapchainData& data, float& outNormalizedT);
-    void DispatchGenerationPass(SwapchainData& data, VkQueue queue, uint32_t imageIndex, float t);
-    void PresentRealFrame(SwapchainData& data, VkQueue queue, uint32_t imageIndex);
 };
 
 } // namespace FrameFlux

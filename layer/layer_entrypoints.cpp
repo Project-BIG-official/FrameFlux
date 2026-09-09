@@ -4,6 +4,7 @@
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_layer.h>
 #include "swapchain_interceptor.hpp"
+#include "vulkan_extensions.hpp"
 
 #include <unordered_map>
 #include <mutex>
@@ -172,6 +173,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
     const VkAllocationCallbacks* pAllocator,
     VkDevice* pDevice
 ) {
+    std::cout << "[PB FrameFlux Hook] vkCreateDevice intercepted!" << std::endl;
+
     // Detect graphics queue family from DXVK's device request
     if (pCreateInfo->queueCreateInfoCount > 0 && pCreateInfo->pQueueCreateInfos) {
         g_graphicsQueueFamilyIndex = pCreateInfo->pQueueCreateInfos[0].queueFamilyIndex;
@@ -185,6 +188,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
 
     if (!chainInfo) return VK_ERROR_INITIALIZATION_FAILED;
 
+    // 1. Declare downstream pointers
     PFN_vkGetInstanceProcAddr nextGIPA = chainInfo->u.pLayerInfo->pfnNextGetInstanceProcAddr;
     PFN_vkGetDeviceProcAddr nextGDPA = chainInfo->u.pLayerInfo->pfnNextGetDeviceProcAddr;
     
@@ -193,12 +197,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
         realCreateDevice = (PFN_vkCreateDevice)nextGIPA(VK_NULL_HANDLE, "vkCreateDevice");
     }
 
+    // 2. Safely query downstream extension prober function pointer
+    PFN_vkEnumerateDeviceExtensionProperties pfnEnum = 
+        (PFN_vkEnumerateDeviceExtensionProperties)nextGIPA(g_instance, "vkEnumerateDeviceExtensionProperties");
+
     chainInfo->u.pLayerInfo = chainInfo->u.pLayerInfo->pNext;
 
     VkResult res = realCreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
     if (res != VK_SUCCESS) return res;
 
-        Interceptor::Get().SetDeviceInfo(g_deviceMemoryProperties, g_graphicsQueueFamilyIndex);
+    // 3. Probe extensions safely without calling loader trampolines
+    ExtensionManager::Get().ProbeDeviceExtensions(physicalDevice, pCreateInfo, pfnEnum);
 
     DeviceDispatch dispatch{};
     dispatch.GetDeviceProcAddr = nextGDPA;
@@ -212,6 +221,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
         g_deviceDispatches[GetDispatchKey(*pDevice)] = dispatch;
         g_globalDeviceDispatch = dispatch;
     }
+
+    Interceptor::Get().SetDeviceInfo(g_deviceMemoryProperties, g_graphicsQueueFamilyIndex);
 
     return VK_SUCCESS;
 }
