@@ -203,8 +203,19 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
 
     chainInfo->u.pLayerInfo = chainInfo->u.pLayerInfo->pNext;
 
-    VkResult res = realCreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
+VkResult res = realCreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
     if (res != VK_SUCCESS) return res;
+
+    // Query memory properties directly for THIS specific device and physical device
+    PFN_vkGetPhysicalDeviceMemoryProperties pfnGetMemProps = 
+        (PFN_vkGetPhysicalDeviceMemoryProperties)nextGIPA(g_instance, "vkGetPhysicalDeviceMemoryProperties");
+    if (!pfnGetMemProps) {
+        pfnGetMemProps = (PFN_vkGetPhysicalDeviceMemoryProperties)nextGIPA(VK_NULL_HANDLE, "vkGetPhysicalDeviceMemoryProperties");
+    }
+
+    if (pfnGetMemProps) {
+        pfnGetMemProps(physicalDevice, &g_deviceMemoryProperties);
+    }
 
     // 3. Probe extensions safely without calling loader trampolines
     ExtensionManager::Get().ProbeDeviceExtensions(physicalDevice, pCreateInfo, pfnEnum);

@@ -32,25 +32,16 @@ void SettingsManager::SaveToFile() {
     outFile << "# PB FrameFlux Configuration File\n"
             << "# Auto-generated & synced on launch. Edit parameters to customize.\n\n"
             << "[general]\n"
-            << "# Generation mode: 'v2' (True Optical Flow FG), 'v1' (Legacy Frame Blend), 'off'\n"
             << "mode = " << m_settings.mode << "\n\n"
-            << "# Quality profile: 'quality' (2-pass pyramid refinement), 'performance' (fast single-pass)\n"
             << "profile = " << m_settings.profile << "\n\n"
-            << "# Frame generation multiplier: 2, 3, 4, 5, or 6\n"
             << "multiplier = " << m_settings.multiplier << "\n\n"
-            << "# Scheduler mode: 'auto' (syncs to display VBlank), 'fixed' (strict pacing), 'target_fps' (locks to target_fps)\n"
             << "scheduler_mode = " << m_settings.schedulerMode << "\n\n"
-            << "# Target FPS: used when scheduler_mode = 'target_fps' (e.g. 60, 120, 144, 165). 0 = auto\n"
             << "target_fps = " << m_settings.targetFps << "\n\n"
             << "[quality]\n"
-            << "# Search mode: 'high' (+-24px wide motion search), 'standard' (+-8px fast search)\n"
             << "search_mode = " << m_settings.searchMode << "\n\n"
-            << "# Fallback action when motion confidence drops: 'blend', 'repeat', 'drop' (for VRR/FreeSync displays)\n"
             << "fallback_action = " << m_settings.fallbackAction << "\n\n"
             << "[hud]\n"
-            << "# Show telemetry HUD stats: true / false\n"
             << "show_hud = " << (m_settings.showWatermark ? "true" : "false") << "\n\n"
-            << "# HUD Corner: 0 = Top-Left, 1 = Top-Right, 2 = Bottom-Left, 3 = Bottom-Right\n"
             << "hud_corner = " << m_settings.hudCorner << "\n";
     outFile.close();
 
@@ -90,7 +81,7 @@ void SettingsManager::SyncAndLoadFile(const std::string& path) {
     m_settings.schedulerMode = getOrDef("scheduler_mode", "auto");
     m_settings.targetFps = (uint32_t)atoi(getOrDef("target_fps", "0").c_str());
     m_settings.searchMode = getOrDef("search_mode", "high");
-    m_settings.fallbackAction = getOrDef("fallback_action", "blend");
+    m_settings.fallbackAction = getOrDef("fallback_action", "repeat");
     m_settings.showWatermark = (getOrDef("show_hud", "false") == "true" || getOrDef("show_watermark", "false") == "true");
     m_settings.hudCorner = std::clamp((uint32_t)atoi(getOrDef("hud_corner", "0").c_str()), 0u, 3u);
 
@@ -107,10 +98,10 @@ void SettingsManager::CheckHotReload() {
             return;
         }
 
+        // Only reload from disk if external editor changed the file (do NOT reapply env overrides)
         if (currentWriteTime > m_lastConfigWriteTime) {
             m_lastConfigWriteTime = currentWriteTime;
             SyncAndLoadFile(m_activeConfigPath);
-            ApplyEnvironmentOverrides();
             std::cout << "\n[PB FrameFlux Live Reload] Config reloaded from disk!" << std::endl;
         }
     } catch (...) {}
@@ -132,6 +123,7 @@ void SettingsManager::LoadOrCreate() {
     }
 
     SyncAndLoadFile(m_activeConfigPath);
+    // Environment variables only set initial values on first launch
     ApplyEnvironmentOverrides();
 }
 

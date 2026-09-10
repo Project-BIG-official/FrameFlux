@@ -1,5 +1,5 @@
 // PB FrameFlux - LGPL-2.1
-// warp_interpolate.slang: Motion-Compensated Warping with Anti-Ghosting & UI Protection
+// warp_interpolate.slang: Particle-Aware Warping with Rain Ghosting Rejection
 
 enum FallbackAction : uint32_t {
     RepeatFrame = 0,
@@ -27,29 +27,51 @@ ConstantBuffer<PushConstants> pc;
 
 [[vk::binding(5, 0)]] RWTexture2D<float4> outputFrame;
 
-float4 sampleWarped(Texture2D<float4> tex, float2 uv) {
-    float2 clampedUV = clamp(uv, float2(0.0), float2(1.0));
+float4 sampleColor(Texture2D<float4> tex, float2 uv) {
+    float2 clampedUV = clamp(uv, float2(0.0001), float2(0.9999));
     return tex.SampleLevel(linearSampler, clampedUV, 0.0);
 }
 
-// Bounding-box neighborhood clamping (safe against ghosting halos)
-float4 clampToNeighborhood(float4 color, Texture2D<float4> texB, uint2 centerPixel) {
-    int2 center = int2(centerPixel);
-    float4 centerCol = texB[centerPixel];
-    float4 minCol = centerCol;
-    float4 maxCol = centerCol;
+// 5-tap median filter to eliminate rogue motion vectors produced by rain/particles
+float2 getFilteredMotion(float2 uv) {
+    float2 offsets[5] = {
+        float2(0.0, 0.0),
+        float2(-1.5,  0.0) * pc.invResolution,
+        float2( 1.5,  0.0) * pc.invResolution,
+        float2( 0.0, -1.5) * pc.invResolution,
+        float2( 0.0,  1.5) * pc.invResolution
+    };
+
+    float2 v0 = motionVectors.SampleLevel(linearSampler, uv + offsets[0], 0.0);
+    float2 v1 = motionVectors.SampleLevel(linearSampler, uv + offsets[1], 0.0);
+    float2 v2 = motionVectors.SampleLevel(linearSampler, uv + offsets[2], 0.0);
+    float2 v3 = motionVectors.SampleLevel(linearSampler, uv + offsets[3], 0.0);
+    float2 v4 = motionVectors.SampleLevel(linearSampler, uv + offsets[4], 0.0);
+
+    // Approximate component-wise median
+    float2 min1 = min(v0, v1); float2 max1 = max(v0, v1);
+    float2 min2 = min(v2, v3); float2 max2 = max(v2, v3);
+    float2 midMin = max(min1, min2);
+    float2 midMax = min(max1, max2);
+    return clamp(v4, min(midMin, midMax), max(midMin, midMax));
+}
+
+// Computes 3x3 neighborhood bounding box to prevent ghost halos
+void getNeighborhoodBox(uint2 pixelCoord, out float3 boxMin, out float3 boxMax) {
+    int2 center = int2(pixelCoord);
+    boxMin = float3(1e5);
+    boxMax = float3(-1e5);
 
     [unroll]
-    for (int dy = -1; dy <= 1; ++dy) {
+    for (int y = -1; y <= 1; ++y) {
         [unroll]
-        for (int dx = -1; dx <= 1; ++dx) {
-            int2 sampleCoord = clamp(center + int2(dx, dy), int2(0), int2(pc.resolution) - 1);
-            float4 c = texB[sampleCoord];
-            minCol = min(minCol, c);
-            maxCol = max(maxCol, c);
+        for (int x = -1; x <= 1; ++x) {
+            int2 sampleCoord = clamp(center + int2(x, y), int2(0), int2(pc.resolution) - 1);
+            float3 c = frameB[sampleCoord].rgb;
+            boxMin = min(boxMin, c);
+            boxMax = max(boxMax, c);
         }
     }
-    return clamp(color, minCol, maxCol);
 }
 
 [shader("compute")]
@@ -58,58 +80,103 @@ void computeMain(uint32_t3 dispatchThreadID : SV_DispatchThreadID) {
     uint2 pixelCoord = dispatchThreadID.xy;
     if (pixelCoord.x >= pc.resolution.x || pixelCoord.y >= pc.resolution.y) return;
 
-    float2 uv = (float2(pixelCoord) + 0.5) * pc.invResolution;
+    float4 rawA = frameA[pixelCoord];
+    float4 rawB = frameB[pixelCoord];
 
-    float2 motion = motionVectors.SampleLevel(linearSampler, uv, 0.0);
-    float confidence = confidenceMap.SampleLevel(linearSampler, uv, 0.0);
-
-    // 1. Static UI & crosshair lock (Zero-Motion Protection)
-    if (dot(motion, motion) < 0.02 && confidence > 0.85) {
-        outputFrame[pixelCoord] = frameB[pixelCoord];
+    // =========================================================================
+    // 1. STATIC UI / HUD PRESERVATION (Crosshair, Minimap, Text)
+    // =========================================================================
+    float rawColorDiff = max(abs(rawA.r - rawB.r), max(abs(rawA.g - rawB.g), abs(rawA.b - rawB.b)));
+    if (rawColorDiff < 0.032) {
+        outputFrame[pixelCoord] = rawB;
         return;
     }
 
-    float4 finalColor;
+    // =========================================================================
+    // 2. TRANSIENT PARTICLE & RAIN DETECTION (High-Frequency Luma Laplacian)
+    // =========================================================================
+    // Raindrops and sparks are thin (1-2px) local spatial spikes present in one
+    // frame, but absent in the other. We detect spatial cross-variance.
+    int2 coord = int2(pixelCoord);
+    int2 clampMax = int2(pc.resolution) - 1;
 
-    // 2. Low confidence fallback
+    float4 nbL = frameB[clamp(coord + int2(-1,  0), int2(0), clampMax)];
+    float4 nbR = frameB[clamp(coord + int2( 1,  0), int2(0), clampMax)];
+    float4 nbU = frameB[clamp(coord + int2( 0, -1), int2(0), clampMax)];
+    float4 nbD = frameB[clamp(coord + int2( 0,  1), int2(0), clampMax)];
+    float3 avgBNeighbors = (nbL.rgb + nbR.rgb + nbU.rgb + nbD.rgb) * 0.25;
+
+    float4 naL = frameA[clamp(coord + int2(-1,  0), int2(0), clampMax)];
+    float4 naR = frameA[clamp(coord + int2( 1,  0), int2(0), clampMax)];
+    float4 naU = frameA[clamp(coord + int2( 0, -1), int2(0), clampMax)];
+    float4 naD = frameA[clamp(coord + int2( 0,  1), int2(0), clampMax)];
+    float3 avgANeighbors = (naL.rgb + naR.rgb + naU.rgb + naD.rgb) * 0.25;
+
+    float localContrastB = length(rawB.rgb - avgBNeighbors);
+    float localContrastA = length(rawA.rgb - avgANeighbors);
+
+    // Rain drop in Frame B: thin high-frequency contrast in B, but absent in A
+    bool isRainParticleB = (localContrastB > 0.075 && localContrastA < 0.025);
+    // Rain drop in Frame A: thin high-frequency contrast in A, but gone in B
+    bool isRainParticleA = (localContrastA > 0.075 && localContrastB < 0.025);
+
+    if (isRainParticleB) {
+        // Do NOT smear Frame B's raindrops with background vectors!
+        // Introduce smoothly based on time factor without trailing smears
+        outputFrame[pixelCoord] = (pc.t < 0.35) ? rawA : lerp(rawA, rawB, smoothstep(0.35, 1.0, pc.t));
+        return;
+    }
+
+    if (isRainParticleA) {
+        // Fade out Frame A's disappearing raindrop cleanly
+        outputFrame[pixelCoord] = (pc.t > 0.65) ? rawB : lerp(rawA, rawB, smoothstep(0.0, 0.65, pc.t));
+        return;
+    }
+
+    // =========================================================================
+    // 3. MOTION-COMPENSATED WARPING WITH MEDIAN FILTERING
+    // =========================================================================
+    float2 uv = (float2(pixelCoord) + 0.5) * pc.invResolution;
+
+    // Use median-filtered vector to reject isolated rain-induced vector anomalies
+    float2 motion = getFilteredMotion(uv);
+    float confidence = confidenceMap.SampleLevel(linearSampler, uv, 0.0);
+
+    // Temporal fallback on occlusions/unreliable vectors
     if (confidence < pc.confidenceThreshold) {
-        float4 colA = sampleWarped(frameA, uv);
-        float4 colB = sampleWarped(frameB, uv);
+        outputFrame[pixelCoord] = (pc.t < 0.5) ? rawA : rawB;
+        return;
+    }
 
-        switch (pc.fallbackAction) {
-            case (uint32_t)FallbackAction::RepeatFrame:
-                finalColor = (pc.t < 0.5) ? colA : colB;
-                break;
+    // Warped lookups
+    float2 motionUV = motion * pc.invResolution;
+    float2 uvA = uv - (motionUV * pc.t);
+    float2 uvB = uv + (motionUV * (1.0 - pc.t));
 
-            case (uint32_t)FallbackAction::DropFrame:
-                finalColor = colB;
-                break;
+    float4 sampleA = sampleColor(frameA, uvA);
+    float4 sampleB = sampleColor(frameB, uvB);
 
-            case (uint32_t)FallbackAction::BlendFrame:
-            default:
-                finalColor = lerp(colA, colB, pc.t);
-                break;
-        }
+    // =========================================================================
+    // 4. DISOCCLUSION CHECK & COLOR BOX CLAMPING (Anti-Halo)
+    // =========================================================================
+    float lumaA = dot(sampleA.rgb, float3(0.299, 0.587, 0.114));
+    float lumaB = dot(sampleB.rgb, float3(0.299, 0.587, 0.114));
+    float photometricDiff = abs(lumaA - lumaB);
+
+    float4 finalColor;
+    if (photometricDiff > 0.20) {
+        // Disocclusion: sample closest real temporal frame, avoiding semi-transparent silhouettes
+        finalColor = (pc.t < 0.5) ? sampleA : sampleB;
     } else {
-        // 3. Motion compensation with photometric disocclusion
-        float2 motionUV = motion * pc.invResolution;
-        float2 uvA = uv - (motionUV * pc.t);
-        float2 uvB = uv + (motionUV * (1.0 - pc.t));
+        float4 interpolated = lerp(sampleA, sampleB, pc.t);
 
-        float4 sampleA = sampleWarped(frameA, uvA);
-        float4 sampleB = sampleWarped(frameB, uvB);
+        // Clamp interpolated color to the 3x3 neighborhood of Frame B
+        // This stops color bleeding and trailing halos around high-contrast edges
+        float3 boxMin, boxMax;
+        getNeighborhoodBox(pixelCoord, boxMin, boxMax);
+        float3 clampedRgb = clamp(interpolated.rgb, boxMin - float3(0.03), boxMax + float3(0.03));
 
-        float lumaA = dot(sampleA.rgb, float3(0.299, 0.587, 0.114));
-        float lumaB = dot(sampleB.rgb, float3(0.299, 0.587, 0.114));
-        float colorDiff = abs(lumaA - lumaB);
-
-        if (colorDiff > 0.35) {
-            float edgeWeight = smoothstep(0.1, 0.9, pc.t);
-            float4 rawInterpolated = lerp(sampleA, sampleB, edgeWeight);
-            finalColor = clampToNeighborhood(rawInterpolated, frameB, pixelCoord);
-        } else {
-            finalColor = lerp(sampleA, sampleB, pc.t);
-        }
+        finalColor = float4(clampedRgb, interpolated.a);
     }
 
     outputFrame[pixelCoord] = finalColor;

@@ -1,5 +1,5 @@
 // PB FrameFlux - LGPL-2.1
-// layer/swapchain_interceptor.hpp: Complete Unified Swapchain Header
+// layer/swapchain_interceptor.hpp: Complete Header with True Fractional Multiplier & Telemetry
 
 #pragma once
 
@@ -19,8 +19,21 @@ namespace FrameFlux {
 
 enum class FrameFluxMode {
     Disabled,
-    LegacyV1, // v1.0 Fast Blend (0.05ms)
-    TrueFGV2  // v2.0 True Optical Flow FG
+    LegacyV1,
+    TrueFGV2
+};
+
+constexpr uint32_t MAX_FRAMES_IN_FLIGHT = 2;
+constexpr uint32_t MAX_MULTIPLIER_FRAMES = 6;
+
+struct FrameFlightResources {
+    VkCommandBuffer genCommandBuffers[MAX_MULTIPLIER_FRAMES]{};
+    VkCommandBuffer realCommandBuffer = VK_NULL_HANDLE;
+    VkFence frameFence = VK_NULL_HANDLE;
+    VkSemaphore genDoneSemaphores[MAX_MULTIPLIER_FRAMES]{};
+    VkSemaphore realDoneSemaphore = VK_NULL_HANDLE;
+    VkSemaphore acquireSemaphores[MAX_MULTIPLIER_FRAMES]{};
+    bool isFenceSignaled = true;
 };
 
 struct SwapchainData {
@@ -36,17 +49,11 @@ struct SwapchainData {
     FrameFluxMode mode = FrameFluxMode::TrueFGV2;
     FrametimeSmoother smoother;
 
-    // Command resources
     VkCommandPool commandPool = VK_NULL_HANDLE;
-    VkCommandBuffer genCommandBuffer = VK_NULL_HANDLE;
-    VkCommandBuffer realCommandBuffer = VK_NULL_HANDLE;
 
-    // Synchronization Semaphores
-    VkSemaphore timelineSemaphore = VK_NULL_HANDLE;
-    VkSemaphore internalAcquireSemaphore = VK_NULL_HANDLE;
-    VkSemaphore realDoneSemaphore = VK_NULL_HANDLE;
-    std::vector<VkSemaphore> acquireSemaphores;
-    std::vector<VkSemaphore> genDoneSemaphores;
+    // Flight ring buffer resources
+    FrameFlightResources frameSlots[MAX_FRAMES_IN_FLIGHT];
+    uint32_t currentFlightSlot = 0;
 
     // Full-Res RGBA Frame history
     VkImage frameAImage = VK_NULL_HANDLE;
@@ -66,7 +73,7 @@ struct SwapchainData {
     VkDeviceMemory lumaBMemory = VK_NULL_HANDLE;
     VkImageView lumaBView = VK_NULL_HANDLE;
 
-    // Half-Res Pyramid Luma textures (for Quality 2-Pass Refinement)
+    // Half-Res Pyramid Luma textures
     VkImage lumaAHalfImage = VK_NULL_HANDLE;
     VkDeviceMemory lumaAHalfMemory = VK_NULL_HANDLE;
     VkImageView lumaAHalfView = VK_NULL_HANDLE;
@@ -75,7 +82,7 @@ struct SwapchainData {
     VkDeviceMemory lumaBHalfMemory = VK_NULL_HANDLE;
     VkImageView lumaBHalfView = VK_NULL_HANDLE;
 
-    // Motion & Confidence Textures
+    // Motion and Confidence textures
     VkImage dummyCoarseImage = VK_NULL_HANDLE;
     VkDeviceMemory dummyCoarseMemory = VK_NULL_HANDLE;
     VkImageView dummyCoarseView = VK_NULL_HANDLE;
@@ -97,9 +104,7 @@ struct SwapchainData {
     VkDeviceMemory generatedMemory = VK_NULL_HANDLE;
     VkImageView generatedView = VK_NULL_HANDLE;
 
-    VkDescriptorSet overlayDescSet = VK_NULL_HANDLE;
-
-    // Sampler & Descriptor Pools
+    // Sampler & Descriptors
     VkSampler linearSampler = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
 
@@ -109,24 +114,30 @@ struct SwapchainData {
     VkDescriptorSet refineDescSet = VK_NULL_HANDLE;
     VkDescriptorSet directFlowDescSet = VK_NULL_HANDLE;
     VkDescriptorSet warpDescSet = VK_NULL_HANDLE;
+    VkDescriptorSet overlayDescSet = VK_NULL_HANDLE;
 
     // Timing metrics
     std::chrono::high_resolution_clock::time_point lastPresentTime;
+    std::chrono::high_resolution_clock::time_point lastPresentExitTime; // Pure game render clock
     float smoothedFrametimeMs = 16.6f;
     uint32_t frameCounter = 0;
-
     uint32_t totalAllocatedVramMb = 0;
-    float lastCpuTimeMs = 0.03f;
-    std::chrono::high_resolution_clock::time_point presentStartTime;
+    float lastCpuTimeMs = 0.05f;
+    float lastGpuTimeMs = 1.2f;
+    float smoothedOutputFps = 60.0f;
+
+    // Fractional Phase Accumulator (True Non-Integer Multiplier)
+    float fractionalDebt = 0.0f;
 };
 
 class Interceptor {
 public:
     static Interceptor& Get();
 
-    void SetDeviceInfo(const VkPhysicalDeviceMemoryProperties& memProps, uint32_t queueFamily) {
+    void SetDeviceInfo(const VkPhysicalDeviceMemoryProperties& memProps, uint32_t queueFamily, VkPhysicalDevice physDev = VK_NULL_HANDLE) {
         m_cachedMemProps = memProps;
         m_cachedQueueFamily = queueFamily;
+        m_cachedPhysicalDevice = physDev;
     }
 
     VkResult OnCreateSwapchainKHR(
@@ -160,10 +171,10 @@ private:
 
     VkPhysicalDeviceMemoryProperties m_cachedMemProps{};
     uint32_t m_cachedQueueFamily = 0;
+    VkPhysicalDevice m_cachedPhysicalDevice = VK_NULL_HANDLE;
 
     bool AllocateFrameBuffers(SwapchainData& data);
     void CleanupSwapchainData(SwapchainData& data);
-    void ComputeAdaptiveTiming(SwapchainData& data, float& outNormalizedT);
 };
 
 } // namespace FrameFlux
