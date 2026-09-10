@@ -70,6 +70,7 @@ set(SLANG_SHADERS
     "${SHADER_DIR}/flow_downsample.slang"
     "${SHADER_DIR}/flow_refine_subgroup.slang"
     "${SHADER_DIR}/fallback_blend.slang"
+    "${SHADER_DIR}/overlay_hud.slang"
 )
 
 set(GENERATED_SPV_HEADERS "")

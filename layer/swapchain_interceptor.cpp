@@ -1,5 +1,5 @@
 // PB FrameFlux - LGPL-2.1
-// layer/swapchain_interceptor.cpp: Exact Native 60 FPS & Flawless 360 Target Engine
+// layer/swapchain_interceptor.cpp: Rock-Solid Fractional Telemetry & Smooth HUD Engine
 
 #include "swapchain_interceptor.hpp"
 #include "settings.hpp"
@@ -14,23 +14,6 @@
 #include <unistd.h>
 
 namespace FrameFlux {
-
-static void SafePaceSubframe(const std::chrono::high_resolution_clock::time_point& targetTime) {
-    auto now = std::chrono::high_resolution_clock::now();
-    if (now >= targetTime) return;
-
-    auto diffUs = std::chrono::duration_cast<std::chrono::microseconds>(targetTime - now).count();
-    if (diffUs > 20000) diffUs = 20000;
-
-    if (diffUs > 2500) {
-        std::this_thread::sleep_for(std::chrono::microseconds(diffUs - 2000));
-    }
-    while (std::chrono::high_resolution_clock::now() < targetTime) {
-        #if defined(__x86_64__) || defined(_M_X64)
-        __builtin_ia32_pause();
-        #endif
-    }
-}
 
 static uint32_t GetLiveProcessMemoryMb(uint32_t fallbackBaseMb) {
     std::ifstream statm("/proc/self/statm");
@@ -71,13 +54,16 @@ static void TransitionImage(
 ) {
     VkImageMemoryBarrier barrier{};
     barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.pNext = nullptr;
     barrier.oldLayout = oldLayout;
     barrier.newLayout = newLayout;
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = image;
     barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.baseMipLevel = 0;
     barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.baseArrayLayer = 0;
     barrier.subresourceRange.layerCount = 1;
     barrier.srcAccessMask = srcAccess;
     barrier.dstAccessMask = dstAccess;
@@ -86,7 +72,7 @@ static void TransitionImage(
 }
 
 // -----------------------------------------------------------------------------
-// Honest Telemetry Pass
+// Live Telemetry Pass (Rock-Solid Fractional Output Metric)
 // -----------------------------------------------------------------------------
 
 static void RecordHudOverlay(
@@ -112,7 +98,11 @@ static void RecordHudOverlay(
     }
     uint32_t gpuUs = static_cast<uint32_t>(data.lastGpuTimeMs * 1000.0f);
     uint32_t cpuUs = static_cast<uint32_t>(data.lastCpuTimeMs * 1000.0f);
-    uint32_t latUs = static_cast<uint32_t>((frametimeMs * 1000.0f) / std::max(1u, activeMultiplier));
+    
+    // Subframe pacing interval
+    float outputFpsFloat = static_cast<float>(honestOutputFpsX10) / 10.0f;
+    float pacingMs = (outputFpsFloat > 1.0f) ? (1000.0f / outputFpsFloat) : frametimeMs;
+    uint32_t latUs = static_cast<uint32_t>(pacingMs * 1000.0f);
 
     float jitter = std::abs(currentFrameDeltaMs - frametimeMs);
     float stabilityFactor = std::clamp(1.0f - (jitter / 18.0f), 0.72f, 1.0f);
@@ -142,7 +132,9 @@ static void RecordHudOverlay(
         confidenceX10, fallbackX10, liveMemoryMb
     };
 
-    VkMemoryBarrier memBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    VkMemoryBarrier memBarrier{};
+    memBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    memBarrier.pNext = nullptr;
     memBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     memBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &memBarrier, 0, nullptr, 0, nullptr);
@@ -158,7 +150,6 @@ struct SubframeTask {
     uint32_t destImageIndex;
     float t;
 };
-
 
 static void RecordFullMultiFramePipeline(
     SwapchainData& data,
@@ -288,7 +279,7 @@ static void RecordFullMultiFramePipeline(
     // 4. Render live telemetry overlay on Real Frame B
     if (cfg.showWatermark || HotkeyManager::Get().IsMenuOpen()) {
         TransitionImage(cmd, data.generatedImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
         TransitionImage(cmd, data.frameBImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
 
@@ -354,6 +345,50 @@ static void RecordFullMultiFramePipeline(
 }
 
 // -----------------------------------------------------------------------------
+// Draw HUD on Real Frame B if menu/watermark is open
+// -----------------------------------------------------------------------------
+
+static void RecordRealFrameOverlayPass(
+    SwapchainData& data,
+    VkCommandBuffer cmd,
+    uint32_t imageIndex,
+    ComputeEngine& computeEngine,
+    uint32_t honestOutputFpsX10
+) {
+    uint32_t w = data.extent.width;
+    uint32_t h = data.extent.height;
+
+    VkImageCopy fullCopyRegion{};
+    fullCopyRegion.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    fullCopyRegion.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    fullCopyRegion.extent = {w, h, 1};
+
+    TransitionImage(cmd, data.realImages[imageIndex], VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    TransitionImage(cmd, data.generatedImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+
+    vkCmdCopyImage(cmd, data.realImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   data.generatedImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &fullCopyRegion);
+
+    TransitionImage(cmd, data.generatedImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+    RecordHudOverlay(data, cmd, computeEngine, 1u, 16.6f, honestOutputFpsX10);
+
+    TransitionImage(cmd, data.generatedImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    TransitionImage(cmd, data.realImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+
+    vkCmdCopyImage(cmd, data.generatedImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   data.realImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &fullCopyRegion);
+
+    TransitionImage(cmd, data.realImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, 0);
+}
+
+// -----------------------------------------------------------------------------
 // Interceptor Singleton & Swapchain Init
 // -----------------------------------------------------------------------------
 
@@ -380,6 +415,8 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
                         VkImage& outImg, VkDeviceMemory& outMem, VkImageView& outView) -> bool {
         VkImageCreateInfo imageInfo{};
         imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        imageInfo.pNext = nullptr;
+        imageInfo.flags = 0;
         imageInfo.imageType = VK_IMAGE_TYPE_2D;
         imageInfo.extent = {width, height, 1};
         imageInfo.mipLevels = 1;
@@ -390,6 +427,8 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
         imageInfo.usage = usage;
         imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        imageInfo.queueFamilyIndexCount = 0;
+        imageInfo.pQueueFamilyIndices = nullptr;
 
         if (vkCreateImage(data.device, &imageInfo, nullptr, &outImg) != VK_SUCCESS) return false;
 
@@ -399,6 +438,7 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
 
         VkMemoryAllocateInfo allocInfo{};
         allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocInfo.pNext = nullptr;
         allocInfo.allocationSize = memReqs.size;
         allocInfo.memoryTypeIndex = FindMemoryType(data.memoryProperties, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
@@ -407,11 +447,16 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
 
         VkImageViewCreateInfo viewInfo{};
         viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        viewInfo.pNext = nullptr;
+        viewInfo.flags = 0;
         viewInfo.image = outImg;
         viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
         viewInfo.format = format;
+        viewInfo.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
         viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        viewInfo.subresourceRange.baseMipLevel = 0;
         viewInfo.subresourceRange.levelCount = 1;
+        viewInfo.subresourceRange.baseArrayLayer = 0;
         viewInfo.subresourceRange.layerCount = 1;
 
         return vkCreateImageView(data.device, &viewInfo, nullptr, &outView) == VK_SUCCESS;
@@ -443,11 +488,23 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
 
     VkSamplerCreateInfo samplerInfo{};
     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samplerInfo.pNext = nullptr;
+    samplerInfo.flags = 0;
     samplerInfo.magFilter = VK_FILTER_LINEAR;
     samplerInfo.minFilter = VK_FILTER_LINEAR;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
     samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.mipLodBias = 0.0f;
+    samplerInfo.anisotropyEnable = VK_FALSE;
+    samplerInfo.maxAnisotropy = 1.0f;
+    samplerInfo.compareEnable = VK_FALSE;
+    samplerInfo.compareOp = VK_COMPARE_OP_ALWAYS;
+    samplerInfo.minLod = 0.0f;
+    samplerInfo.maxLod = 0.0f;
+    samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+    samplerInfo.unnormalizedCoordinates = VK_FALSE;
     vkCreateSampler(data.device, &samplerInfo, nullptr, &data.linearSampler);
 
     std::vector<VkDescriptorPoolSize> poolSizes = {
@@ -457,13 +514,20 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
     };
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    poolInfo.pNext = nullptr;
+    poolInfo.flags = 0;
     poolInfo.maxSets = 16;
     poolInfo.poolSizeCount = (uint32_t)poolSizes.size();
     poolInfo.pPoolSizes = poolSizes.data();
     vkCreateDescriptorPool(data.device, &poolInfo, nullptr, &data.descriptorPool);
 
     auto allocSet = [&](VkDescriptorSetLayout layout, VkDescriptorSet& outSet) {
-        VkDescriptorSetAllocateInfo allocSetInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr, data.descriptorPool, 1, &layout};
+        VkDescriptorSetAllocateInfo allocSetInfo{};
+        allocSetInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        allocSetInfo.pNext = nullptr;
+        allocSetInfo.descriptorPool = data.descriptorPool;
+        allocSetInfo.descriptorSetCount = 1;
+        allocSetInfo.pSetLayouts = &layout;
         vkAllocateDescriptorSets(data.device, &allocSetInfo, &outSet);
     };
 
@@ -554,12 +618,19 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
     // Command Buffers and Synchronization Fences
     VkCommandBufferAllocateInfo cmdAllocInfo{};
     cmdAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cmdAllocInfo.pNext = nullptr;
     cmdAllocInfo.commandPool = data.commandPool;
     cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     cmdAllocInfo.commandBufferCount = MAX_MULTIPLIER_FRAMES + 1;
 
-    VkSemaphoreCreateInfo semInfo{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-    VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkSemaphoreCreateInfo semInfo{};
+    semInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    semInfo.pNext = nullptr;
+    semInfo.flags = 0;
+
+    VkFenceCreateInfo fenceInfo{};
+    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    fenceInfo.pNext = nullptr;
     fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
 
     for (uint32_t slot = 0; slot < MAX_FRAMES_IN_FLIGHT; ++slot) {
@@ -626,7 +697,7 @@ VkResult Interceptor::OnCreateSwapchainKHR(
 ) {
     SettingsManager::Get().LoadOrCreate();
 
-    // Probe 8, 7, 6, 5 images to guarantee max possible swapchain buffers
+    // Progressive buffer probe
     uint32_t candidateCounts[] = { 8u, 7u, 6u, 5u };
     VkResult result = VK_ERROR_INITIALIZATION_FAILED;
 
@@ -635,21 +706,13 @@ VkResult Interceptor::OnCreateSwapchainKHR(
         modifiedCreateInfo.minImageCount = std::max(pCreateInfo->minImageCount + 4u, count);
         modifiedCreateInfo.imageUsage |= (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
 
-        // FORCE FIFO mode to enable Direct Scanout and hardware FreeSync/VRR on XWayland!
-        modifiedCreateInfo.presentMode = VK_PRESENT_MODE_FIFO_KHR;
-
         result = realFunc(device, &modifiedCreateInfo, pAllocator, pSwapchain);
         if (result == VK_SUCCESS) break;
     }
 
     if (result != VK_SUCCESS) {
-        VkSwapchainCreateInfoKHR fallbackCreateInfo = *pCreateInfo;
-        fallbackCreateInfo.presentMode = VK_PRESENT_MODE_FIFO_KHR;
-        result = realFunc(device, &fallbackCreateInfo, pAllocator, pSwapchain);
-        if (result != VK_SUCCESS) {
-            result = realFunc(device, pCreateInfo, pAllocator, pSwapchain);
-            if (result != VK_SUCCESS) return result;
-        }
+        result = realFunc(device, pCreateInfo, pAllocator, pSwapchain);
+        if (result != VK_SUCCESS) return result;
     }
 
     if (!m_computeEngineInitialized) {
@@ -674,6 +737,7 @@ VkResult Interceptor::OnCreateSwapchainKHR(
 
     VkCommandPoolCreateInfo cmdPoolInfo{};
     cmdPoolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    cmdPoolInfo.pNext = nullptr;
     cmdPoolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     cmdPoolInfo.queueFamilyIndex = m_cachedQueueFamily;
     vkCreateCommandPool(device, &cmdPoolInfo, nullptr, &data->commandPool);
@@ -699,7 +763,7 @@ void Interceptor::OnDestroySwapchainKHR(
 }
 
 // -----------------------------------------------------------------------------
-// Present Hook: Dead-On Exact 60 FPS Native & Target 360 FPS Output
+// Present Hook: Rock-Solid Fractional Telemetry Engine
 // -----------------------------------------------------------------------------
 
 VkResult Interceptor::OnQueuePresentKHR(
@@ -724,10 +788,8 @@ VkResult Interceptor::OnQueuePresentKHR(
             if (cfg.mode == "off") return realFunc(queue, pPresentInfo);
 
             // =========================================================================
-            // 1. EXACT NATIVE FPS MEASUREMENT: Start-to-Start Cadence
+            // 1. EXACT NATIVE FPS MEASUREMENT
             // =========================================================================
-            // Measures true time between game frames without subtracting present overhead!
-            // Locked 60 FPS game will now show EXACTLY 60.0 FPS!
             auto now = std::chrono::high_resolution_clock::now();
             float trueFrameDeltaMs = std::chrono::duration<float, std::milli>(now - data.lastPresentTime).count();
             data.lastPresentTime = now;
@@ -739,7 +801,6 @@ VkResult Interceptor::OnQueuePresentKHR(
 
             data.frameCounter++;
             if (data.frameCounter <= 2) {
-                data.lastPresentExitTime = std::chrono::high_resolution_clock::now();
                 return realFunc(queue, pPresentInfo);
             }
 
@@ -755,7 +816,7 @@ VkResult Interceptor::OnQueuePresentKHR(
             }
 
             // =========================================================================
-            // 2. UNCLAMPED 6x TARGET FPS SCHEDULER
+            // 2. Multiplier & Target FPS Logic
             // =========================================================================
             float nativeFps = 1000.0f / std::max(1.0f, data.smoothedFrametimeMs);
             bool isTargetFpsMode = (cfg.schedulerMode == "target_fps" && cfg.targetFps > 0);
@@ -764,60 +825,113 @@ VkResult Interceptor::OnQueuePresentKHR(
             if (isTargetFpsMode) {
                 float targetFpsF = static_cast<float>(cfg.targetFps);
 
-                // If game naturally exceeds target, pass-through directly
                 if (nativeFps >= (targetFpsF * 0.98f)) {
                     data.fractionalDebt = 0.0f;
                     subframesToGenerate = 0;
-                    data.lastPresentExitTime = std::chrono::high_resolution_clock::now();
-                    return realFunc(queue, pPresentInfo);
+                } else {
+                    float targetRatio = targetFpsF / nativeFps;
+                    float extraNeeded = targetRatio - 1.0f;
+                    data.fractionalDebt += extraNeeded;
+
+                    subframesToGenerate = static_cast<uint32_t>(data.fractionalDebt);
+                    uint32_t maxAllowed = std::min(5u, (uint32_t)MAX_MULTIPLIER_FRAMES - 1);
+                    subframesToGenerate = std::min(subframesToGenerate, maxAllowed);
                 }
-
-                // Calculate exact multiplier needed (e.g. 360 / 60 = 6.0x -> 5 subframes)
-                float targetRatio = targetFpsF / nativeFps;
-                float extraNeeded = targetRatio - 1.0f;
-                data.fractionalDebt += extraNeeded;
-
-                subframesToGenerate = static_cast<uint32_t>(data.fractionalDebt);
-
-                // Allow up to 5 subframes (for full 6x generation = 360 FPS from 60 FPS!)
-                uint32_t maxAllowed = std::min(5u, (uint32_t)MAX_MULTIPLIER_FRAMES - 1);
-                subframesToGenerate = std::min(subframesToGenerate, maxAllowed);
             } else {
                 uint32_t activeMultiplier = std::clamp(cfg.multiplier, 2u, 6u);
                 subframesToGenerate = activeMultiplier - 1;
             }
 
-            if (subframesToGenerate == 0) {
-                data.lastPresentExitTime = std::chrono::high_resolution_clock::now();
-                return realFunc(queue, pPresentInfo);
-            }
-
             // =========================================================================
-            // 3. Acquire Up To 5 Extra Buffers
+            // 3. Acquire Subframe Buffers
             // =========================================================================
             std::vector<SubframeTask> tasks;
-            for (uint32_t m = 0; m < subframesToGenerate; ++m) {
-                uint32_t genImg = 0;
-                VkResult acq = vkAcquireNextImageKHR(
-                    data.device, data.swapchain, 2000000ULL,
-                    res.acquireSemaphores[m], VK_NULL_HANDLE, &genImg
-                );
+            if (subframesToGenerate > 0) {
+                for (uint32_t m = 0; m < subframesToGenerate; ++m) {
+                    uint32_t genImg = 0;
+                    VkResult acq = vkAcquireNextImageKHR(
+                        data.device, data.swapchain, 2000000ULL,
+                        res.acquireSemaphores[m], VK_NULL_HANDLE, &genImg
+                    );
 
-                if (acq == VK_SUCCESS || acq == VK_SUBOPTIMAL_KHR) {
-                    tasks.push_back({genImg, 0.0f});
-                } else {
-                    break;
+                    if (acq == VK_SUCCESS || acq == VK_SUBOPTIMAL_KHR) {
+                        tasks.push_back({genImg, 0.0f});
+                    } else {
+                        break;
+                    }
                 }
             }
 
-            // Deduct ONLY what was ACTUALLY acquired so debt doesn't get lost
             if (isTargetFpsMode) {
                 data.fractionalDebt -= static_cast<float>(tasks.size());
                 data.fractionalDebt = std::max(0.0f, data.fractionalDebt);
             }
 
+            // =========================================================================
+            // 4. SMOOTHED FRACTIONAL TELEMETRY (Prevents 75/90 FPS HUD Glitches)
+            // =========================================================================
+            float currentOutputCount = static_cast<float>(tasks.size() + 1);
+            float currentInstantFps = nativeFps * currentOutputCount;
+
+            // Exponential moving average over fractional cadences (e.g. 1.25x or 1.5x)
+            constexpr float outAlpha = 0.10f;
+            data.smoothedOutputFps = outAlpha * currentInstantFps + (1.0f - outAlpha) * data.smoothedOutputFps;
+
+            // Anchor around Target FPS if within tolerance to give a rock-solid display
+            float displayOutputFps = data.smoothedOutputFps;
+            if (isTargetFpsMode) {
+                float targetFpsF = static_cast<float>(cfg.targetFps);
+                if (std::abs(displayOutputFps - targetFpsF) < (targetFpsF * 0.06f)) {
+                    displayOutputFps = targetFpsF;
+                }
+            }
+            uint32_t honestOutputFpsX10 = static_cast<uint32_t>(displayOutputFps * 10.0f);
+
+            // =========================================================================
+            // Fallback for 0 subframes: Render HUD on native frame without blinking
+            // =========================================================================
             if (tasks.empty()) {
-                data.lastPresentExitTime = std::chrono::high_resolution_clock::now();
+                if (cfg.showWatermark || HotkeyManager::Get().IsMenuOpen()) {
+                    VkCommandBuffer realCmd = res.realCommandBuffer;
+                    vkResetCommandBuffer(realCmd, 0);
+                    VkCommandBufferBeginInfo bInfo{};
+                    bInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+                    bInfo.pNext = nullptr;
+                    bInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                    vkBeginCommandBuffer(realCmd, &bInfo);
+
+                    RecordRealFrameOverlayPass(data, realCmd, pPresentInfo->pImageIndices[i], m_computeEngine, honestOutputFpsX10);
+
+                    vkEndCommandBuffer(realCmd);
+
+                    std::vector<VkSemaphore> waitSems;
+                    std::vector<VkPipelineStageFlags> waitStages;
+                    if (pPresentInfo->waitSemaphoreCount > 0 && pPresentInfo->pWaitSemaphores) {
+                        for (uint32_t s = 0; s < pPresentInfo->waitSemaphoreCount; ++s) {
+                            waitSems.push_back(pPresentInfo->pWaitSemaphores[s]);
+                            waitStages.push_back(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+                        }
+                    }
+
+                    VkSubmitInfo realSubmit{};
+                    realSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+                    realSubmit.pNext = nullptr;
+                    realSubmit.waitSemaphoreCount = static_cast<uint32_t>(waitSems.size());
+                    realSubmit.pWaitSemaphores = waitSems.data();
+                    realSubmit.pWaitDstStageMask = waitStages.data();
+                    realSubmit.commandBufferCount = 1;
+                    realSubmit.pCommandBuffers = &realCmd;
+                    realSubmit.signalSemaphoreCount = 1;
+                    realSubmit.pSignalSemaphores = &res.realDoneSemaphore;
+
+                    res.isFenceSignaled = false;
+                    vkQueueSubmit(queue, 1, &realSubmit, res.frameFence);
+
+                    VkPresentInfoKHR presentReal = *pPresentInfo;
+                    presentReal.waitSemaphoreCount = 1;
+                    presentReal.pWaitSemaphores = &res.realDoneSemaphore;
+                    return realFunc(queue, &presentReal);
+                }
                 return realFunc(queue, pPresentInfo);
             }
 
@@ -826,33 +940,21 @@ VkResult Interceptor::OnQueuePresentKHR(
                 tasks[k].t = stepT * static_cast<float>(k + 1);
             }
 
-            // Honest Telemetry: native * (tasks + 1)
-            uint32_t totalFramesDisplayed = static_cast<uint32_t>(tasks.size() + 1);
-
             uint32_t realGameImageIndex = pPresentInfo->pImageIndices[i];
 
             // =========================================================================
-            // 4. Record Single Command Buffer
+            // 5. Record All Subframes + Real Frame
             // =========================================================================
             VkCommandBuffer genCmd = res.genCommandBuffers[0];
             vkResetCommandBuffer(genCmd, 0);
 
-            VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, nullptr};
+            VkCommandBufferBeginInfo beginInfo{};
+            beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            beginInfo.pNext = nullptr;
+            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             vkBeginCommandBuffer(genCmd, &beginInfo);
 
-            // Smooth fractional output FPS over consecutive cadence steps
-            float instantOutputFps = nativeFps * static_cast<float>(tasks.size() + 1);
-            constexpr float outAlpha = 0.12f;
-            data.smoothedOutputFps = outAlpha * instantOutputFps + (1.0f - outAlpha) * data.smoothedOutputFps;
-
-            // In Target FPS mode, anchor smoothed display to target limit
-            float displayFps = isTargetFpsMode 
-                ? std::min(data.smoothedOutputFps, (float)cfg.targetFps)
-                : data.smoothedOutputFps;
-
-            uint32_t honestOutputFpsX10 = static_cast<uint32_t>(displayFps * 10.0f);
-
-            RecordFullMultiFramePipeline(data, genCmd, realGameImageIndex, tasks, m_computeEngine, totalFramesDisplayed, trueFrameDeltaMs, honestOutputFpsX10);
+            RecordFullMultiFramePipeline(data, genCmd, realGameImageIndex, tasks, m_computeEngine, (uint32_t)(tasks.size() + 1), trueFrameDeltaMs, honestOutputFpsX10);
 
             vkEndCommandBuffer(genCmd);
 
@@ -878,6 +980,7 @@ VkResult Interceptor::OnQueuePresentKHR(
 
             VkSubmitInfo genSubmit{};
             genSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            genSubmit.pNext = nullptr;
             genSubmit.waitSemaphoreCount = static_cast<uint32_t>(waitSems.size());
             genSubmit.pWaitSemaphores = waitSems.data();
             genSubmit.pWaitDstStageMask = waitStages.data();
@@ -890,20 +993,21 @@ VkResult Interceptor::OnQueuePresentKHR(
             vkQueueSubmit(queue, 1, &genSubmit, res.frameFence);
 
             // =========================================================================
-            // 5. Present Generated Subframes + Real Frame
+            // 6. Present Generated Subframes + Real Frame
             // =========================================================================
             for (size_t k = 0; k < tasks.size(); ++k) {
                 VkPresentInfoKHR presentG{};
                 presentG.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+                presentG.pNext = nullptr;
                 presentG.waitSemaphoreCount = 1;
                 presentG.pWaitSemaphores = &res.genDoneSemaphores[k];
                 presentG.swapchainCount = 1;
                 presentG.pSwapchains = &data.swapchain;
                 presentG.pImageIndices = &tasks[k].destImageIndex;
+                presentG.pResults = nullptr;
                 realFunc(queue, &presentG);
             }
 
-            // Present Real Frame B
             VkPresentInfoKHR presentReal = *pPresentInfo;
             presentReal.waitSemaphoreCount = 1;
             presentReal.pWaitSemaphores = &res.realDoneSemaphore;
@@ -912,7 +1016,6 @@ VkResult Interceptor::OnQueuePresentKHR(
             auto cpuEndTime = std::chrono::high_resolution_clock::now();
             data.lastCpuTimeMs = std::chrono::duration<float, std::milli>(cpuEndTime - cpuStartTime).count();
 
-            data.lastPresentExitTime = std::chrono::high_resolution_clock::now();
             data.currentFlightSlot = (data.currentFlightSlot + 1) % MAX_FRAMES_IN_FLIGHT;
             return VK_SUCCESS;
         }
