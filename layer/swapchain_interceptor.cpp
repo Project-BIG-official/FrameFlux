@@ -806,7 +806,9 @@ VkResult Interceptor::OnQueuePresentKHR(
 
         if (it != m_swapchains.end()) {
             SwapchainData& data = *(it->second);
-            if (!data.buffersAllocated) return realFunc(queue, pPresentInfo);
+            if (!data.buffersAllocated) {
+                return realFunc(queue, pPresentInfo);
+            }
 
             const auto& cfg = SettingsManager::Get().GetSettings();
 
@@ -824,7 +826,6 @@ VkResult Interceptor::OnQueuePresentKHR(
                     vk(data.device).ResetCommandBuffer(realCmd, 0);
                     VkCommandBufferBeginInfo bInfo{};
                     bInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-                    bInfo.pNext = nullptr;
                     bInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
                     vk(data.device).BeginCommandBuffer(realCmd, &bInfo);
 
@@ -843,7 +844,6 @@ VkResult Interceptor::OnQueuePresentKHR(
 
                     VkSubmitInfo realSubmit{};
                     realSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-                    realSubmit.pNext = nullptr;
                     realSubmit.waitSemaphoreCount = static_cast<uint32_t>(waitSems.size());
                     realSubmit.pWaitSemaphores = waitSems.data();
                     realSubmit.pWaitDstStageMask = waitStages.data();
@@ -965,7 +965,6 @@ VkResult Interceptor::OnQueuePresentKHR(
                     vk(data.device).ResetCommandBuffer(realCmd, 0);
                     VkCommandBufferBeginInfo bInfo{};
                     bInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-                    bInfo.pNext = nullptr;
                     bInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
                     vk(data.device).BeginCommandBuffer(realCmd, &bInfo);
 
@@ -984,7 +983,6 @@ VkResult Interceptor::OnQueuePresentKHR(
 
                     VkSubmitInfo realSubmit{};
                     realSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-                    realSubmit.pNext = nullptr;
                     realSubmit.waitSemaphoreCount = static_cast<uint32_t>(waitSems.size());
                     realSubmit.pWaitSemaphores = waitSems.data();
                     realSubmit.pWaitDstStageMask = waitStages.data();
@@ -1018,7 +1016,6 @@ VkResult Interceptor::OnQueuePresentKHR(
 
             VkCommandBufferBeginInfo beginInfo{};
             beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-            beginInfo.pNext = nullptr;
             beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             vk(data.device).BeginCommandBuffer(genCmd, &beginInfo);
 
@@ -1049,7 +1046,6 @@ VkResult Interceptor::OnQueuePresentKHR(
 
             VkFrameBoundaryEXT frameBoundary{};
             frameBoundary.sType = VK_STRUCTURE_TYPE_FRAME_BOUNDARY_EXT;
-            frameBoundary.pNext = nullptr;
             frameBoundary.flags = VK_FRAME_BOUNDARY_FRAME_END_BIT_EXT;
             frameBoundary.frameID = data.frameCounter;
             frameBoundary.imageCount = 1;
@@ -1071,13 +1067,11 @@ VkResult Interceptor::OnQueuePresentKHR(
             for (size_t k = 0; k < tasks.size(); ++k) {
                 VkPresentInfoKHR presentG{};
                 presentG.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-                presentG.pNext = nullptr;
                 presentG.waitSemaphoreCount = 1;
                 presentG.pWaitSemaphores = &res.genDoneSemaphores[k];
                 presentG.swapchainCount = 1;
                 presentG.pSwapchains = &data.swapchain;
                 presentG.pImageIndices = &tasks[k].destImageIndex;
-                presentG.pResults = nullptr;
 
                 realFunc(queue, &presentG);
             }

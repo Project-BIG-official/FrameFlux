@@ -1,5 +1,5 @@
 // PB FrameFlux - LGPL-2.1
-// layer/layer_entrypoints.cpp: Robust Wine/DXVK/Native Vulkan Interceptor
+// layer/layer_entrypoints.cpp: Robust Multi-Device & Queue Interceptor
 
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_layer.h>
@@ -32,6 +32,8 @@ struct InstanceDispatch {
 struct DeviceDispatch {
     PFN_vkGetDeviceProcAddr GetDeviceProcAddr = nullptr;
     PFN_vkDestroyDevice DestroyDevice = nullptr;
+    PFN_vkGetDeviceQueue GetDeviceQueue = nullptr;
+    PFN_vkGetDeviceQueue2 GetDeviceQueue2 = nullptr;
     PFN_vkCreateSwapchainKHR CreateSwapchainKHR = nullptr;
     PFN_vkDestroySwapchainKHR DestroySwapchainKHR = nullptr;
     PFN_vkQueuePresentKHR QueuePresentKHR = nullptr;
@@ -47,6 +49,65 @@ template <typename DispatchableType>
 void* GetDispatchKey(DispatchableType inst) {
     if (!inst) return nullptr;
     return *(void**)inst;
+}
+
+static VKAPI_ATTR void VKAPI_CALL Hook_GetDeviceQueue(
+    VkDevice device,
+    uint32_t queueFamilyIndex,
+    uint32_t queueIndex,
+    VkQueue* pQueue
+) {
+    PFN_vkGetDeviceQueue realFunc = nullptr;
+    DeviceDispatch dispatch{};
+    {
+        std::lock_guard<std::mutex> lock(g_dispatchLock);
+        void* key = GetDispatchKey(device);
+        auto it = g_deviceDispatches.find(key);
+        if (it != g_deviceDispatches.end()) {
+            dispatch = it->second;
+            realFunc = dispatch.GetDeviceQueue;
+        } else {
+            realFunc = g_globalDeviceDispatch.GetDeviceQueue;
+            dispatch = g_globalDeviceDispatch;
+        }
+    }
+
+    if (realFunc) {
+        realFunc(device, queueFamilyIndex, queueIndex, pQueue);
+        if (pQueue && *pQueue) {
+            std::lock_guard<std::mutex> lock(g_dispatchLock);
+            g_deviceDispatches[GetDispatchKey(*pQueue)] = dispatch;
+        }
+    }
+}
+
+static VKAPI_ATTR void VKAPI_CALL Hook_GetDeviceQueue2(
+    VkDevice device,
+    const VkDeviceQueueInfo2* pQueueInfo,
+    VkQueue* pQueue
+) {
+    PFN_vkGetDeviceQueue2 realFunc = nullptr;
+    DeviceDispatch dispatch{};
+    {
+        std::lock_guard<std::mutex> lock(g_dispatchLock);
+        void* key = GetDispatchKey(device);
+        auto it = g_deviceDispatches.find(key);
+        if (it != g_deviceDispatches.end()) {
+            dispatch = it->second;
+            realFunc = dispatch.GetDeviceQueue2;
+        } else {
+            realFunc = g_globalDeviceDispatch.GetDeviceQueue2;
+            dispatch = g_globalDeviceDispatch;
+        }
+    }
+
+    if (realFunc) {
+        realFunc(device, pQueueInfo, pQueue);
+        if (pQueue && *pQueue) {
+            std::lock_guard<std::mutex> lock(g_dispatchLock);
+            g_deviceDispatches[GetDispatchKey(*pQueue)] = dispatch;
+        }
+    }
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateSwapchainKHR(
@@ -93,15 +154,24 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(
     VkQueue queue,
     const VkPresentInfoKHR* pPresentInfo
 ) {
+    if (!queue || !pPresentInfo) return VK_ERROR_INITIALIZATION_FAILED;
+
     PFN_vkQueuePresentKHR realFunc = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_dispatchLock);
         void* key = GetDispatchKey(queue);
         auto it = g_deviceDispatches.find(key);
-        realFunc = (it != g_deviceDispatches.end()) ? it->second.QueuePresentKHR : g_globalDeviceDispatch.QueuePresentKHR;
+        if (it != g_deviceDispatches.end() && it->second.QueuePresentKHR) {
+            realFunc = it->second.QueuePresentKHR;
+        } else {
+            realFunc = g_globalDeviceDispatch.QueuePresentKHR;
+        }
     }
 
-    if (!realFunc) return VK_ERROR_INITIALIZATION_FAILED;
+    if (!realFunc) {
+        std::cerr << "[HOOK ERROR] realFunc for vkQueuePresentKHR is NULL!" << std::endl;
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
     return Interceptor::Get().OnQueuePresentKHR(queue, pPresentInfo, realFunc);
 }
 
@@ -278,6 +348,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
     DeviceDispatch dispatch{};
     dispatch.GetDeviceProcAddr = nextGDPA;
     dispatch.DestroyDevice = (PFN_vkDestroyDevice)nextGDPA(*pDevice, "vkDestroyDevice");
+    dispatch.GetDeviceQueue = (PFN_vkGetDeviceQueue)nextGDPA(*pDevice, "vkGetDeviceQueue");
+    dispatch.GetDeviceQueue2 = (PFN_vkGetDeviceQueue2)nextGDPA(*pDevice, "vkGetDeviceQueue2");
     dispatch.CreateSwapchainKHR = (PFN_vkCreateSwapchainKHR)nextGDPA(*pDevice, "vkCreateSwapchainKHR");
     dispatch.DestroySwapchainKHR = (PFN_vkDestroySwapchainKHR)nextGDPA(*pDevice, "vkDestroySwapchainKHR");
     dispatch.QueuePresentKHR = (PFN_vkQueuePresentKHR)nextGDPA(*pDevice, "vkQueuePresentKHR");
@@ -288,6 +360,21 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
         g_globalDeviceDispatch = dispatch;
     }
 
+    // Предварительно связываем все очереди созданного устройства
+    if (dispatch.GetDeviceQueue) {
+        for (uint32_t q = 0; q < pCreateInfo->queueCreateInfoCount; ++q) {
+            uint32_t qFam = pCreateInfo->pQueueCreateInfos[q].queueFamilyIndex;
+            for (uint32_t qc = 0; qc < pCreateInfo->pQueueCreateInfos[q].queueCount; ++qc) {
+                VkQueue qHandle = VK_NULL_HANDLE;
+                dispatch.GetDeviceQueue(*pDevice, qFam, qc, &qHandle);
+                if (qHandle != VK_NULL_HANDLE) {
+                    std::lock_guard<std::mutex> lock(g_dispatchLock);
+                    g_deviceDispatches[GetDispatchKey(qHandle)] = dispatch;
+                }
+            }
+        }
+    }
+
     return VK_SUCCESS;
 }
 
@@ -296,6 +383,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
 VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL FrameFlux_GetDeviceProcAddr(VkDevice device, const char* pName) {
     if (!pName) return nullptr;
     if (strcmp(pName, "vkGetDeviceProcAddr") == 0) return (PFN_vkVoidFunction)FrameFlux_GetDeviceProcAddr;
+    if (strcmp(pName, "vkGetDeviceQueue") == 0) return (PFN_vkVoidFunction)FrameFlux::Hook_GetDeviceQueue;
+    if (strcmp(pName, "vkGetDeviceQueue2") == 0) return (PFN_vkVoidFunction)FrameFlux::Hook_GetDeviceQueue2;
     if (strcmp(pName, "vkCreateSwapchainKHR") == 0) return (PFN_vkVoidFunction)FrameFlux::Hook_CreateSwapchainKHR;
     if (strcmp(pName, "vkDestroySwapchainKHR") == 0) return (PFN_vkVoidFunction)FrameFlux::Hook_DestroySwapchainKHR;
     if (strcmp(pName, "vkQueuePresentKHR") == 0) return (PFN_vkVoidFunction)FrameFlux::Hook_QueuePresentKHR;
@@ -318,6 +407,8 @@ VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL FrameFlux_GetInstancePr
     if (!pName) return nullptr;
     if (strcmp(pName, "vkGetInstanceProcAddr") == 0) return (PFN_vkVoidFunction)FrameFlux_GetInstanceProcAddr;
     if (strcmp(pName, "vkGetDeviceProcAddr") == 0) return (PFN_vkVoidFunction)FrameFlux_GetDeviceProcAddr;
+    if (strcmp(pName, "vkGetDeviceQueue") == 0) return (PFN_vkVoidFunction)FrameFlux::Hook_GetDeviceQueue;
+    if (strcmp(pName, "vkGetDeviceQueue2") == 0) return (PFN_vkVoidFunction)FrameFlux::Hook_GetDeviceQueue2;
     if (strcmp(pName, "vkCreateInstance") == 0) return (PFN_vkVoidFunction)FrameFlux::Hook_CreateInstance;
     if (strcmp(pName, "vkCreateDevice") == 0) return (PFN_vkVoidFunction)FrameFlux::Hook_CreateDevice;
     if (strcmp(pName, "vkGetPhysicalDeviceMemoryProperties") == 0) return (PFN_vkVoidFunction)FrameFlux::Hook_GetPhysicalDeviceMemoryProperties;
