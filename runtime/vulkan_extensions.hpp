@@ -1,5 +1,5 @@
 // PB FrameFlux - LGPL-2.1
-// runtime/vulkan_extensions.hpp: Full Multi-Level Fallback Extensions System
+// runtime/vulkan_extensions.hpp: Full Multi-Level Fallback Extensions System with Universal CI Compatibility
 
 #pragma once
 
@@ -16,6 +16,9 @@
 #include <time.h>
 #endif
 
+// -----------------------------------------------------------------------------
+// 1. AMD Anti-Lag
+// -----------------------------------------------------------------------------
 #ifndef VK_AMD_anti_lag
 #define VK_AMD_anti_lag 1
 #define VK_STRUCTURE_TYPE_ANTI_LAG_DATA_AMD ((VkStructureType)1000476000)
@@ -46,6 +49,9 @@ struct VkAntiLagDataAMD {
 typedef void (VKAPI_PTR *PFN_vkAntiLagUpdateAMD)(VkDevice device, const VkAntiLagDataAMD* pData);
 #endif
 
+// -----------------------------------------------------------------------------
+// 2. NVIDIA Low Latency 2 (Reflex)
+// -----------------------------------------------------------------------------
 #ifndef VK_NV_low_latency2
 #define VK_NV_low_latency2 1
 #define VK_STRUCTURE_TYPE_SET_LATENCY_MARKER_INFO_NV ((VkStructureType)1000505002)
@@ -77,6 +83,9 @@ typedef VkResult (VKAPI_PTR *PFN_vkSetLatencyMarkerNV)(VkDevice device, VkSwapch
 typedef VkResult (VKAPI_PTR *PFN_vkLatencySleepNV)(VkDevice device, VkSwapchainKHR swapchain, const VkLatencySleepInfoNV* pSleepInfo);
 #endif
 
+// -----------------------------------------------------------------------------
+// 3. Present ID & Present Wait
+// -----------------------------------------------------------------------------
 #ifndef VK_KHR_present_id
 #define VK_KHR_present_id 1
 #define VK_STRUCTURE_TYPE_PRESENT_ID_KHR ((VkStructureType)1000268000)
@@ -117,7 +126,10 @@ struct VkPresentWait2InfoKHR {
 typedef VkResult (VKAPI_PTR *PFN_vkWaitForPresent2KHR)(VkDevice device, VkSwapchainKHR swapchain, const VkPresentWait2InfoKHR* pPresentWait2Info);
 #endif
 
-#if !defined(VK_EXT_swapchain_maintenance1) && !defined(VK_KHR_swapchain_maintenance1)
+// -----------------------------------------------------------------------------
+// 4. Swapchain Maintenance 1
+// -----------------------------------------------------------------------------
+#ifndef VK_EXT_swapchain_maintenance1
 #define VK_EXT_swapchain_maintenance1 1
 #define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT ((VkStructureType)1000275000)
 #define VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_EXT ((VkStructureType)1000275001)
@@ -134,6 +146,40 @@ struct VkSwapchainPresentFenceInfoEXT {
 };
 #endif
 
+#ifndef VK_KHR_swapchain_maintenance1
+#define VK_KHR_swapchain_maintenance1 1
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT
+#define VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_EXT
+typedef VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR;
+typedef VkSwapchainPresentFenceInfoEXT VkSwapchainPresentFenceInfoKHR;
+#endif
+
+// -----------------------------------------------------------------------------
+// 5. Frame Boundary
+// -----------------------------------------------------------------------------
+#ifndef VK_EXT_frame_boundary
+#define VK_EXT_frame_boundary 1
+#define VK_STRUCTURE_TYPE_FRAME_BOUNDARY_EXT ((VkStructureType)1000375000)
+#define VK_FRAME_BOUNDARY_FRAME_END_BIT_EXT 0x00000001
+typedef VkFlags VkFrameBoundaryFlagsEXT;
+struct VkFrameBoundaryEXT {
+    VkStructureType sType;
+    const void* pNext;
+    VkFrameBoundaryFlagsEXT flags;
+    uint64_t frameID;
+    uint32_t imageCount;
+    const VkImage* pImages;
+    uint32_t bufferCount;
+    const VkBuffer* pBuffers;
+    uint64_t tagName;
+    size_t tagSize;
+    const void* pTag;
+};
+#endif
+
+// -----------------------------------------------------------------------------
+// 6. Display Timing
+// -----------------------------------------------------------------------------
 #ifndef VK_EXT_present_timing
 #define VK_EXT_present_timing 1
 #define VK_STRUCTURE_TYPE_SWAPCHAIN_TIMING_PROPERTIES_EXT ((VkStructureType)1000209000)
@@ -154,22 +200,57 @@ struct VkRefreshCycleDurationGOOGLE {
 typedef VkResult (VKAPI_PTR *PFN_vkGetRefreshCycleDurationGOOGLE)(VkDevice device, VkSwapchainKHR swapchain, VkRefreshCycleDurationGOOGLE* pDisplayTimingProperties);
 #endif
 
-#if !defined(VK_KHR_calibrated_timestamps) && !defined(VK_EXT_calibrated_timestamps)
-#define VK_KHR_calibrated_timestamps 1
-#define VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR ((VkStructureType)1000184000)
-enum VkTimeDomainKHR {
-    VK_TIME_DOMAIN_DEVICE_KHR = 0,
-    VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR = 1,
-    VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_KHR = 2,
-    VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR = 3
+// -----------------------------------------------------------------------------
+// 7. Calibrated Timestamps (Безопасный маппинг KHR <-> EXT для любых версий SDK)
+// -----------------------------------------------------------------------------
+#ifndef VK_EXT_calibrated_timestamps
+#define VK_EXT_calibrated_timestamps 1
+#define VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT ((VkStructureType)1000184000)
+enum VkTimeDomainEXT {
+    VK_TIME_DOMAIN_DEVICE_EXT = 0,
+    VK_TIME_DOMAIN_CLOCK_MONOTONIC_EXT = 1,
+    VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_EXT = 2,
+    VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_EXT = 3
 };
-struct VkCalibratedTimestampInfoKHR {
+struct VkCalibratedTimestampInfoEXT {
     VkStructureType sType;
     const void* pNext;
-    VkTimeDomainKHR timeDomain;
+    VkTimeDomainEXT timeDomain;
 };
-typedef VkResult (VKAPI_PTR *PFN_vkGetCalibratedTimestampsKHR)(VkDevice device, uint32_t timestampCount, const VkCalibratedTimestampInfoKHR* pTimestampInfos, uint64_t* pTimestamps, uint64_t* pMaxDeviation);
-typedef VkResult (VKAPI_PTR *PFN_vkGetCalibratedTimestampsEXT)(VkDevice device, uint32_t timestampCount, const VkCalibratedTimestampInfoKHR* pTimestampInfos, uint64_t* pTimestamps, uint64_t* pMaxDeviation);
+typedef VkResult (VKAPI_PTR *PFN_vkGetCalibratedTimestampsEXT)(VkDevice device, uint32_t timestampCount, const VkCalibratedTimestampInfoEXT* pTimestampInfos, uint64_t* pTimestamps, uint64_t* pMaxDeviation);
+#endif
+
+#ifndef VK_KHR_calibrated_timestamps
+#define VK_KHR_calibrated_timestamps 1
+#define VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT
+#define VK_TIME_DOMAIN_DEVICE_KHR VK_TIME_DOMAIN_DEVICE_EXT
+#define VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR VK_TIME_DOMAIN_CLOCK_MONOTONIC_EXT
+#define VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_KHR VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_EXT
+#define VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_EXT
+typedef VkTimeDomainEXT VkTimeDomainKHR;
+typedef VkCalibratedTimestampInfoEXT VkCalibratedTimestampInfoKHR;
+typedef PFN_vkGetCalibratedTimestampsEXT PFN_vkGetCalibratedTimestampsKHR;
+#endif
+
+// -----------------------------------------------------------------------------
+// 8. Subgroup Size Control
+// -----------------------------------------------------------------------------
+#ifndef VK_EXT_subgroup_size_control
+#define VK_EXT_subgroup_size_control 1
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT ((VkStructureType)1000225000)
+#define VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT ((VkStructureType)1000225001)
+#define VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT 0x00000002
+struct VkPhysicalDeviceSubgroupSizeControlFeaturesEXT {
+    VkStructureType sType;
+    void* pNext;
+    VkBool32 subgroupSizeControl;
+    VkBool32 computeFullSubgroups;
+};
+struct VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT {
+    VkStructureType sType;
+    void* pNext;
+    uint32_t requiredSubgroupSize;
+};
 #endif
 
 namespace FrameFlux {
@@ -257,7 +338,6 @@ public:
         if (m_ext.hasCalibratedTimestampsEXT) pfnGetCalibratedTimestampsEXT = (PFN_vkGetCalibratedTimestampsEXT)gdpa(device, "vkGetCalibratedTimestampsEXT");
     }
 
-    // 1. PRESENT WAIT: 0=Auto, 1=Force Wait2, 2=Force Wait1, 3=Disabled
     VkResult WaitForPresentQueue(VkDevice device, VkSwapchainKHR swapchain, uint64_t presentId, uint32_t mode = 0) {
         if (mode == 3 || device == VK_NULL_HANDLE || swapchain == VK_NULL_HANDLE || presentId == 0) {
             return VK_SUCCESS;
@@ -277,7 +357,6 @@ public:
         return VK_SUCCESS;
     }
 
-    // 2. LOW LATENCY & ANTI-LAG: 0=Auto, 1=AntiLag, 2=Reflex, 3=JIT, 4=Off
     void MarkAntiLagStage(VkDevice device, VkAntiLagStageAMD stage, uint64_t frameIndex, uint32_t debugOverride = 0) {
         if (debugOverride == 2 || debugOverride == 3 || debugOverride == 4) return;
 
@@ -297,7 +376,6 @@ public:
         }
     }
 
-    // 3. DISPLAY TIMING: 0=Auto, 1=EXT, 2=Google, 3=Sysfs, 4=Fixed
     uint64_t QueryDisplayRefreshNs(VkDevice device, VkSwapchainKHR swapchain, uint32_t debugOverride = 0) {
         if (debugOverride == 4) return 6060606ULL; // Fixed 165Hz
 
@@ -317,10 +395,9 @@ public:
             }
         }
 
-        return 0; // -> DRM sysfs scanner
+        return 0;
     }
 
-    // 4. CALIBRATED TIMESTAMPS: 0=Auto, 1=KHR, 2=EXT, 3=QueryPool
     bool QueryCalibratedTimestamps(VkDevice device, uint64_t& outGpuNs, uint64_t& outCpuNs, uint32_t debugOverride = 0) {
         if (debugOverride == 3 || !device) return false;
 
@@ -343,7 +420,7 @@ public:
             }
         }
         if (debugOverride != 1 && pfnGetCalibratedTimestampsEXT) {
-            if (pfnGetCalibratedTimestampsEXT(device, 2, infos, timestamps, &maxDev) == VK_SUCCESS) {
+            if (pfnGetCalibratedTimestampsEXT(device, 2, (const VkCalibratedTimestampInfoEXT*)infos, timestamps, &maxDev) == VK_SUCCESS) {
                 outGpuNs = timestamps[0]; outCpuNs = timestamps[1]; return true;
             }
         }
