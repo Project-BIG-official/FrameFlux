@@ -10,6 +10,7 @@
 #include "flow_refine_subgroup_spv.hpp"
 #include "vulkan_extensions.hpp"
 #include "overlay_hud_spv.hpp"
+#include "vulkan_dispatch.hpp"
 
 #include <iostream>
 #include <vector>
@@ -25,7 +26,7 @@ static VkShaderModule CreateShaderModule(VkDevice device, const uint8_t* byteCod
 
     VkShaderModuleCreateInfo smInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, nullptr, 0, codeSize, alignedCode.data()};
     VkShaderModule module = VK_NULL_HANDLE;
-    vkCreateShaderModule(device, &smInfo, nullptr, &module);
+    vk(device).CreateShaderModule(device, &smInfo, nullptr, &module);
     return module;
 }
 
@@ -38,7 +39,7 @@ bool ComputeEngine::Initialize(VkDevice device, float timestampPeriod) {
     m_timestampPeriod = (timestampPeriod > 0.0f) ? timestampPeriod : 1.0f;
 
     VkQueryPoolCreateInfo qpInfo{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, nullptr, 0, VK_QUERY_TYPE_TIMESTAMP, 2, 0};
-    vkCreateQueryPool(m_device, &qpInfo, nullptr, &m_queryPool);
+    vk(m_device).CreateQueryPool(m_device, &qpInfo, nullptr, &m_queryPool);
 
     return CreateLumaPipeline() && 
            CreateDownsamplePipeline() && 

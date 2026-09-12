@@ -16,6 +16,7 @@
 #include "settings.hpp"
 #include "hotkey_manager.hpp"
 #include "vulkan_extensions.hpp"
+#include "vulkan_dispatch.hpp"
 
 namespace FrameFlux {
 

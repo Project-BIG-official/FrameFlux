@@ -16,6 +16,11 @@ option(FRAMEFLUX_ENABLE_LTO "Enable Link-Time Optimization (LTO)" OFF) # OFF by 
 option(FRAMEFLUX_STATIC_STDLIB "Statically link libstdc++ and libgcc" OFF)
 set(FRAMEFLUX_ARCH "native" CACHE STRING "Target CPU architecture: native, x86-64-v2, x86-64-v3, x86-64-v4")
 
+if(FRAMEFLUX_ARCH STREQUAL "x86-64-v4")
+    # Ограничиваем вектор до 256 бит, чтобы не крашить 32-битный контекст Wine/Proton ZMM регистрами
+    add_compile_options(-mprefer-vector-width=256)
+endif()
+
 # Basic compiler warnings
 add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 

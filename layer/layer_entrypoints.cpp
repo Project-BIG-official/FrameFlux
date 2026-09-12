@@ -5,6 +5,7 @@
 #include <vulkan/vk_layer.h>
 #include "swapchain_interceptor.hpp"
 #include "vulkan_extensions.hpp"
+#include "vulkan_dispatch.hpp"
 
 #include <unordered_map>
 #include <mutex>
@@ -192,6 +193,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
     if (!realCreateDevice) {
         realCreateDevice = (PFN_vkCreateDevice)nextGIPA(VK_NULL_HANDLE, "vkCreateDevice");
     }
+
+    DispatchManager::Get().RegisterDevice(*pDevice, nextGDPA);
+    ExtensionManager::Get().ResolveDeviceFunctions(*pDevice, nextGDPA);
 
     PFN_vkEnumerateDeviceExtensionProperties pfnEnum = 
         (PFN_vkEnumerateDeviceExtensionProperties)nextGIPA(g_instance, "vkEnumerateDeviceExtensionProperties");
