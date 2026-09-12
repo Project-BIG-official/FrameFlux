@@ -1,5 +1,5 @@
 // PB FrameFlux - LGPL-2.1
-// warp_interpolate.slang: OptiScaler-Style Optical Flow Arrows & Middlebury Visualizer
+// warp_interpolate.slang: Anti-Ghosting Warping with Bi-Directional Clamping & OptiScaler Vector Grid
 
 enum FallbackAction : uint {
     RepeatFrame = 0,
@@ -54,8 +54,10 @@ float2 getFilteredMotion(float2 uv) {
     return clamp(v4, min(midMin, midMax), max(midMin, midMax));
 }
 
-void getNeighborhoodBox(uint2 pixelCoord, out float3 boxMin, out float3 boxMax) {
+// Двунаправленный цветовой бокс: учитывает окрестности ОБОИХ кадров A и B для полного устранения гостинга
+void getNeighborhoodBoxBi(uint2 pixelCoord, out float3 boxMin, out float3 boxMax) {
     int2 center = int2(pixelCoord);
+    int2 maxCoord = int2(pc.resolution) - 1;
     boxMin = float3(1e5);
     boxMax = float3(-1e5);
 
@@ -63,32 +65,30 @@ void getNeighborhoodBox(uint2 pixelCoord, out float3 boxMin, out float3 boxMax) 
     for (int y = -1; y <= 1; ++y) {
         [unroll]
         for (int x = -1; x <= 1; ++x) {
-            int2 sampleCoord = clamp(center + int2(x, y), int2(0), int2(pc.resolution) - 1);
-            float3 c = frameB[sampleCoord].rgb;
-            boxMin = min(boxMin, c);
-            boxMax = max(boxMax, c);
+            int2 sampleCoord = clamp(center + int2(x, y), int2(0), maxCoord);
+            float3 cA = frameA[sampleCoord].rgb;
+            float3 cB = frameB[sampleCoord].rgb;
+            boxMin = min(boxMin, min(cA, cB));
+            boxMax = max(boxMax, max(cA, cB));
         }
     }
 }
 
-// Расстояние от точки p до отрезка a-b
 float distToSegment(float2 p, float2 a, float2 b) {
     float2 pa = p - a, ba = b - a;
     float h = saturate(dot(pa, ba) / max(dot(ba, ba), 0.0001));
     return length(pa - ba * h);
 }
 
-// Каноническое цветовое кодирование оптического потока Middlebury (0 = белый, угол = цвет)
 float3 flowToMiddlebury(float2 flow, float maxMotion) {
     float len = length(flow);
     if (len < 0.001) return float3(1.0, 1.0, 1.0);
 
-    float angle = atan2(-flow.y, -flow.x); // [-PI, PI]
-    float hue = (angle / 6.2831853) + 0.5; // [0, 1]
+    float angle = atan2(-flow.y, -flow.x);
+    float hue = (angle / 6.2831853) + 0.5;
 
     float3 rgb = saturate(abs(frac(hue + float3(1.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0);
 
-    // Центр белый (покой), границы насыщенные
     float s = saturate(len / maxMotion);
     float satCurve = pow(s, 0.7);
     return lerp(float3(1.0, 1.0, 1.0), rgb, satCurve);
@@ -119,7 +119,6 @@ void computeMain(uint3 dispatchThreadID : SV_DispatchThreadID) {
     // 0. LIVE DEBUG VISUALIZERS (OPTISCALER ARROWS & MIDDLEBURY FLOW)
     // =========================================================================
     if (pc.showDebugWatermark == 3) {
-        // --- А. Компас направлений в правом нижнем углу ---
         uint legendSize = 90;
         uint margin = 24;
         if (pixelCoord.x >= pc.resolution.x - legendSize - margin && pixelCoord.x < pc.resolution.x - margin &&
@@ -128,7 +127,6 @@ void computeMain(uint3 dispatchThreadID : SV_DispatchThreadID) {
             uint lx = pixelCoord.x - (pc.resolution.x - legendSize - margin);
             uint ly = pixelCoord.y - (pc.resolution.y - legendSize - margin);
 
-            // Граница рамки
             if (lx == 0 || lx == legendSize - 1 || ly == 0 || ly == legendSize - 1) {
                 outputFrame[pixelCoord] = float4(0.12, 0.12, 0.12, 1.0);
                 return;
@@ -139,7 +137,6 @@ void computeMain(uint3 dispatchThreadID : SV_DispatchThreadID) {
             float dist = length(offset);
             float radius = float(legendSize) * 0.46;
 
-            // Перекрестие и риски шкалы
             bool isCrosshair = (abs(offset.x) < 0.75 || abs(offset.y) < 0.75) && (dist < radius);
             bool isTick = (abs(dist - radius * 0.5) < 0.75) && (abs(offset.x) < 3.0 || abs(offset.y) < 3.0);
 
@@ -158,14 +155,11 @@ void computeMain(uint3 dispatchThreadID : SV_DispatchThreadID) {
             }
         }
 
-        // --- Б. Пастельный цветовой фон Middlebury ---
         float2 localFlow = getFilteredMotion(uv);
         float3 flowColor = flowToMiddlebury(localFlow, 16.0);
-        // Легкое подмешивание исходного кадра для читаемости геометрии
         float3 finalBg = lerp(flowColor, rawB.rgb * flowColor, 0.18);
 
-        // --- В. Сетка векторных стрелок (опрос 3x3 соседних ячеек) ---
-        uint gridStep = 22; // Шаг сетки стрелок
+        uint gridStep = 22;
         int2 baseCell = int2(floor(float2(pixelCoord) / float2(gridStep)));
         float minArrowDist = 999.0;
         float minDotDist = 999.0;
@@ -183,13 +177,12 @@ void computeMain(uint3 dispatchThreadID : SV_DispatchThreadID) {
                 float flowLen = length(flow);
 
                 if (flowLen > 0.4) {
-                    float2 v = flow * 2.4; // Масштабирование вектора для наглядности
+                    float2 v = flow * 2.4;
                     float vLen = length(v);
-                    float2 p1 = p0 + v; // Кончик стрелки
+                    float2 p1 = p0 + v;
                     float2 dir = v / vLen;
                     float2 norm = float2(-dir.y, dir.x);
 
-                    // Геометрия наконечника стрелки (V-образные усики)
                     float headLen = clamp(vLen * 0.35, 3.5, 7.5);
                     float headWidth = headLen * 0.55;
                     float2 headBase = p1 - dir * headLen;
@@ -208,13 +201,11 @@ void computeMain(uint3 dispatchThreadID : SV_DispatchThreadID) {
             }
         }
 
-        // Отрисовка черных четких стрелок с антиалиасингом
         if (minArrowDist < 1.0) {
             float alpha = saturate(1.0 - (minArrowDist - 0.4));
             float3 arrowColor = float3(0.04, 0.04, 0.06);
             finalBg = lerp(finalBg, arrowColor, alpha);
         } else if (minDotDist < 1.2) {
-            // Точка покоя в центре ячейки
             finalBg = lerp(finalBg, float3(0.35, 0.35, 0.4), 0.7);
         }
 
@@ -296,21 +287,27 @@ void computeMain(uint3 dispatchThreadID : SV_DispatchThreadID) {
     float4 sampleB = sampleColor(frameB, uvB);
 
     // =========================================================================
-    // 4. DISOCCLUSION CHECK & COLOR BOX CLAMPING
+    // 4. ANTI-GHOSTING DISOCCLUSION CHECK & BI-DIRECTIONAL COLOR CLAMPING
     // =========================================================================
     float lumaA = dot(sampleA.rgb, float3(0.299, 0.587, 0.114));
     float lumaB = dot(sampleB.rgb, float3(0.299, 0.587, 0.114));
     float photometricDiff = abs(lumaA - lumaB);
 
+    float motionSpeed = length(motion);
+    float disocclusionThreshold = lerp(0.12, 0.25, saturate(motionSpeed / 12.0));
+
     float4 finalColor;
-    if (photometricDiff > 0.20) {
+    if (photometricDiff > disocclusionThreshold) {
+        // Дизокклюзия: берем ближайший во времени кадр для устранения раздвоения
         finalColor = (pc.t < 0.5) ? sampleA : sampleB;
     } else {
         float4 interpolated = lerp(sampleA, sampleB, pc.t);
 
         float3 boxMin, boxMax;
-        getNeighborhoodBox(pixelCoord, boxMin, boxMax);
-        float3 clampedRgb = clamp(interpolated.rgb, boxMin - float3(0.03), boxMax + float3(0.03));
+        getNeighborhoodBoxBi(pixelCoord, boxMin, boxMax);
+        
+        float3 padding = float3(lerp(0.015, 0.035, saturate(motionSpeed / 16.0)));
+        float3 clampedRgb = clamp(interpolated.rgb, boxMin - padding, boxMax + padding);
 
         finalColor = float4(clampedRgb, interpolated.a);
     }

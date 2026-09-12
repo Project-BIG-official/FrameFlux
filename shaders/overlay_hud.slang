@@ -133,11 +133,11 @@ uint getHudChar(uint line, uint col, OverlayPushConstants cpc) {
             if (line == 1) { const uint l[9] = {'N','A','T','I','V','E',':',' ',' '}; return l[col]; }
             if (line == 2) { const uint l[9] = {'O','U','T','P','U','T',':',' ',' '}; return l[col]; }
             if (line == 3) { const uint l[9] = {'L','A','T','E','N','C','Y',':',' '}; return l[col]; }
-            if (line == 4) { const uint l[9] = {'P','R','E','S','E','N','T',':',' '}; return l[col]; }
+            if (line == 4) { const uint l[9] = {'L','L',' ','P','R','O','V',':',' '}; return l[col]; }
             if (line == 5) { const uint l[9] = {'D','I','S','P',' ','H','Z',':',' '}; return l[col]; }
             return ' ';
         }
-        if (col >= 9 && col < 15) {
+        if (col >= 9 && col < 18) {
             uint val = 0;
             if (line == 1) val = cpc.nativeFpsX10;
             else if (line == 2) val = cpc.outputFpsX10;
@@ -145,9 +145,10 @@ uint getHudChar(uint line, uint col, OverlayPushConstants cpc) {
             else if (line == 5) val = cpc.displayHz * 10;
 
             if (line == 4) {
-                if (cpc.extPresentWait == 3) { const uint off[3] = {'O','F','F'}; return (col - 9 < 3) ? off[col - 9] : ' '; }
-                if (cpc.extPresentWait == 1) { const uint w2[5] = {'W','A','I','T','2'}; return (col - 9 < 5) ? w2[col - 9] : ' '; }
-                const uint w[5] = {'W','A','I','T','1'}; return (col - 9 < 5) ? w[col - 9] : ' ';
+                if (cpc.lowLatency == 0) { const uint off[3] = {'O','F','F'}; return (col - 9 < 3) ? off[col - 9] : ' '; }
+                if (cpc.extLowLatency == 2) { const uint rx[6] = {'R','E','F','L','E','X'}; return (col - 9 < 6) ? rx[col - 9] : ' '; }
+                if (cpc.extLowLatency == 1) { const uint al[7] = {'A','N','T','I','L','A','G'}; return (col - 9 < 7) ? al[col - 9] : ' '; }
+                const uint jit[8] = {'J','I','T',' ','E','M','U','L'}; return (col - 9 < 8) ? jit[col - 9] : ' ';
             }
 
             if (line == 1 || line == 2 || line == 3 || line == 5) {
@@ -404,7 +405,7 @@ void computeMain(uint3 dispatchThreadID : SV_DispatchThreadID) {
     uint2 pixelCoord = dispatchThreadID.xy;
     if (pixelCoord.x >= pc.resolutionX || pixelCoord.y >= pc.resolutionY) return;
 
-    if (pc.debugVisual == 1 && pc.isMenuOpen == 0) {
+    if (pc.debugVisual == 1) {
         uint badgeX = pc.resolutionX - 52;
         uint badgeY = 16;
         if (pixelCoord.x >= badgeX && pixelCoord.x < badgeX + 36 &&
