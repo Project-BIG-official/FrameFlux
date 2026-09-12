@@ -1,5 +1,5 @@
 // PB FrameFlux - LGPL-2.1
-// layer/layer_entrypoints.cpp: Robust Wine/DXVK/Native Vulkan Interceptor with Extension Injection
+// layer/layer_entrypoints.cpp: Robust Wine/DXVK/Native Vulkan Interceptor
 
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_layer.h>
@@ -16,12 +16,10 @@
 #ifdef VK_LAYER_EXPORT
 #undef VK_LAYER_EXPORT
 #endif
-// Добавлен атрибут 'used', чтобы компилятор и компоновщик ни при каких оптимизациях не вырезали функции слоя
 #define VK_LAYER_EXPORT extern "C" __attribute__((visibility("default"), used))
 
 namespace FrameFlux {
 
-static VkInstance g_instance = VK_NULL_HANDLE;
 static VkPhysicalDeviceMemoryProperties g_deviceMemoryProperties{};
 static uint32_t g_graphicsQueueFamilyIndex = 0;
 
@@ -134,23 +132,26 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateInstance(
     const VkAllocationCallbacks* pAllocator,
     VkInstance* pInstance
 ) {
+    if (!pCreateInfo || !pInstance) return VK_ERROR_INITIALIZATION_FAILED;
+
     VkLayerInstanceCreateInfo* chainInfo = (VkLayerInstanceCreateInfo*)pCreateInfo->pNext;
     while (chainInfo && (chainInfo->sType != VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO ||
                          chainInfo->function != VK_LAYER_LINK_INFO)) {
         chainInfo = (VkLayerInstanceCreateInfo*)chainInfo->pNext;
     }
 
-    if (!chainInfo) return VK_ERROR_INITIALIZATION_FAILED;
+    if (!chainInfo || !chainInfo->u.pLayerInfo) return VK_ERROR_INITIALIZATION_FAILED;
 
     PFN_vkGetInstanceProcAddr nextGIPA = chainInfo->u.pLayerInfo->pfnNextGetInstanceProcAddr;
+    if (!nextGIPA) return VK_ERROR_INITIALIZATION_FAILED;
+
     PFN_vkCreateInstance realCreateInstance = (PFN_vkCreateInstance)nextGIPA(VK_NULL_HANDLE, "vkCreateInstance");
+    if (!realCreateInstance) return VK_ERROR_INITIALIZATION_FAILED;
 
     chainInfo->u.pLayerInfo = chainInfo->u.pLayerInfo->pNext;
 
     VkResult res = realCreateInstance(pCreateInfo, pAllocator, pInstance);
     if (res != VK_SUCCESS) return res;
-
-    g_instance = *pInstance;
 
     InstanceDispatch dispatch{};
     dispatch.GetInstanceProcAddr = nextGIPA;
@@ -172,6 +173,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
     const VkAllocationCallbacks* pAllocator,
     VkDevice* pDevice
 ) {
+    if (!physicalDevice || !pCreateInfo || !pDevice) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
     std::cout << "[PB FrameFlux Hook] vkCreateDevice intercepted!" << std::endl;
 
     if (pCreateInfo->queueCreateInfoCount > 0 && pCreateInfo->pQueueCreateInfos) {
@@ -184,26 +189,34 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
         chainInfo = (VkLayerDeviceCreateInfo*)chainInfo->pNext;
     }
 
-    if (!chainInfo) return VK_ERROR_INITIALIZATION_FAILED;
+    if (!chainInfo || !chainInfo->u.pLayerInfo) return VK_ERROR_INITIALIZATION_FAILED;
 
     PFN_vkGetInstanceProcAddr nextGIPA = chainInfo->u.pLayerInfo->pfnNextGetInstanceProcAddr;
     PFN_vkGetDeviceProcAddr nextGDPA = chainInfo->u.pLayerInfo->pfnNextGetDeviceProcAddr;
     
-    PFN_vkCreateDevice realCreateDevice = (PFN_vkCreateDevice)nextGIPA(g_instance, "vkCreateDevice");
+    if (!nextGIPA || !nextGDPA) return VK_ERROR_INITIALIZATION_FAILED;
+
+    // ВАЖНО: Всегда передаем VK_NULL_HANDLE в nextGIPA для поиска функции создания устройства
+    PFN_vkCreateDevice realCreateDevice = (PFN_vkCreateDevice)nextGIPA(VK_NULL_HANDLE, "vkCreateDevice");
     if (!realCreateDevice) {
-        realCreateDevice = (PFN_vkCreateDevice)nextGIPA(VK_NULL_HANDLE, "vkCreateDevice");
+        std::lock_guard<std::mutex> lock(g_dispatchLock);
+        if (g_globalInstanceDispatch.GetInstanceProcAddr) {
+            realCreateDevice = (PFN_vkCreateDevice)g_globalInstanceDispatch.GetInstanceProcAddr(VK_NULL_HANDLE, "vkCreateDevice");
+        }
+    }
+    if (!realCreateDevice) return VK_ERROR_INITIALIZATION_FAILED;
+
+    // Продвигаем цепочку загрузчика
+    chainInfo->u.pLayerInfo = chainInfo->u.pLayerInfo->pNext;
+
+    // Опрашиваем физический GPU
+    PFN_vkEnumerateDeviceExtensionProperties pfnEnum = 
+        (PFN_vkEnumerateDeviceExtensionProperties)nextGIPA(VK_NULL_HANDLE, "vkEnumerateDeviceExtensionProperties");
+    if (pfnEnum) {
+        ExtensionManager::Get().CollectGpuExtensions(physicalDevice, pfnEnum);
     }
 
-    DispatchManager::Get().RegisterDevice(*pDevice, nextGDPA);
-    ExtensionManager::Get().ResolveDeviceFunctions(*pDevice, nextGDPA);
-
-    PFN_vkEnumerateDeviceExtensionProperties pfnEnum = 
-        (PFN_vkEnumerateDeviceExtensionProperties)nextGIPA(g_instance, "vkEnumerateDeviceExtensionProperties");
-
-    // 1. Опрашиваем физический GPU
-    ExtensionManager::Get().CollectGpuExtensions(physicalDevice, pfnEnum);
-
-    // 2. Проверяем реально доступные расширения на GPU
+    // Собираем список расширений
     std::vector<const char*> enabledExts;
     if (pCreateInfo->ppEnabledExtensionNames) {
         for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; ++i) {
@@ -224,7 +237,6 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
         return false;
     };
 
-    // Активируем безопасные расширения без обязательных Features в pNext
     tryInjectExt("VK_KHR_calibrated_timestamps");
     tryInjectExt("VK_EXT_calibrated_timestamps");
     tryInjectExt("VK_EXT_present_timing");
@@ -232,85 +244,42 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
     tryInjectExt("VK_EXT_frame_boundary");
     tryInjectExt("VK_AMD_anti_lag");
     tryInjectExt("VK_NV_low_latency2");
-
-    // 3. Безопасный запрос Features через vkGetPhysicalDeviceFeatures2
-    PFN_vkGetPhysicalDeviceFeatures2KHR pfnGetFeat2 = 
-        (PFN_vkGetPhysicalDeviceFeatures2KHR)nextGIPA(g_instance, "vkGetPhysicalDeviceFeatures2KHR");
-    if (!pfnGetFeat2) {
-        pfnGetFeat2 = (PFN_vkGetPhysicalDeviceFeatures2KHR)nextGIPA(g_instance, "vkGetPhysicalDeviceFeatures2");
-    }
-
-    void* currentPNext = (void*)pCreateInfo->pNext;
-
-    VkPhysicalDevicePresentWaitFeaturesKHR waitFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR, nullptr, VK_FALSE};
-    VkPhysicalDevicePresentIdFeaturesKHR idFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR, nullptr, VK_FALSE};
-    VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT maintFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT, nullptr, VK_FALSE};
-    VkPhysicalDeviceSubgroupSizeControlFeaturesEXT subgroupFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT, nullptr, VK_FALSE, VK_FALSE};
-
-    if (pfnGetFeat2) {
-        // Связываем структуру запроса
-        void* queryChain = nullptr;
-        auto appendQuery = [&](void* s) {
-            VkBaseOutStructure* st = (VkBaseOutStructure*)s;
-            st->pNext = (VkBaseOutStructure*)queryChain;
-            queryChain = s;
-        };
-
-        bool suppWait = tryInjectExt("VK_KHR_present_wait");
-        tryInjectExt("VK_KHR_present_wait2");
-        bool suppId = tryInjectExt("VK_KHR_present_id");
-        bool suppMaint = tryInjectExt("VK_KHR_swapchain_maintenance1") || tryInjectExt("VK_EXT_swapchain_maintenance1");
-        bool suppSubgroup = tryInjectExt("VK_EXT_subgroup_size_control");
-
-        if (suppWait) appendQuery(&waitFeatures);
-        if (suppId) appendQuery(&idFeatures);
-        if (suppMaint) appendQuery(&maintFeatures);
-        if (suppSubgroup) appendQuery(&subgroupFeatures);
-
-        VkPhysicalDeviceFeatures2 feat2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, queryChain, {}};
-        pfnGetFeat2(physicalDevice, &feat2);
-
-        // Инжектируем в VkDeviceCreateInfo ТОЛЬКО ТО, ЧТО ПОДДЕРЖИВАЕТСЯ ЖЕЛЕЗОМ!
-        auto chainStruct = [&](void* structPtr) {
-            VkBaseOutStructure* s = (VkBaseOutStructure*)structPtr;
-            s->pNext = (VkBaseOutStructure*)currentPNext;
-            currentPNext = structPtr;
-        };
-
-        if (suppWait && waitFeatures.presentWait) chainStruct(&waitFeatures);
-        if (suppId && idFeatures.presentId) chainStruct(&idFeatures);
-        if (suppMaint && maintFeatures.swapchainMaintenance1) chainStruct(&maintFeatures);
-        if (suppSubgroup && subgroupFeatures.subgroupSizeControl) chainStruct(&subgroupFeatures);
-    }
+    tryInjectExt("VK_KHR_present_wait");
+    tryInjectExt("VK_KHR_present_wait2");
+    tryInjectExt("VK_KHR_present_id");
+    tryInjectExt("VK_KHR_swapchain_maintenance1");
+    tryInjectExt("VK_EXT_swapchain_maintenance1");
+    tryInjectExt("VK_EXT_subgroup_size_control");
 
     VkDeviceCreateInfo modifiedCreateInfo = *pCreateInfo;
-    modifiedCreateInfo.pNext = currentPNext;
     modifiedCreateInfo.enabledExtensionCount = static_cast<uint32_t>(enabledExts.size());
     modifiedCreateInfo.ppEnabledExtensionNames = enabledExts.data();
 
-    chainInfo->u.pLayerInfo = chainInfo->u.pLayerInfo->pNext;
-
     VkResult res = realCreateDevice(physicalDevice, &modifiedCreateInfo, pAllocator, pDevice);
     if (res != VK_SUCCESS) {
-        // Fallback на случай строгого окружения
-        res = realCreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
-        if (res != VK_SUCCESS) return res;
+        return res;
     }
 
+    // Регистрируем устройство в безопасной внутренней таблице диспетчеризации
+    DispatchManager::Get().RegisterDevice(*pDevice, nextGDPA);
+    ExtensionManager::Get().ResolveDeviceFunctions(*pDevice, nextGDPA);
+
+    // Получаем свойства памяти и лимиты устройства
     PFN_vkGetPhysicalDeviceMemoryProperties pfnGetMemProps = 
-        (PFN_vkGetPhysicalDeviceMemoryProperties)nextGIPA(g_instance, "vkGetPhysicalDeviceMemoryProperties");
+        (PFN_vkGetPhysicalDeviceMemoryProperties)nextGIPA(VK_NULL_HANDLE, "vkGetPhysicalDeviceMemoryProperties");
     if (pfnGetMemProps) {
         pfnGetMemProps(physicalDevice, &g_deviceMemoryProperties);
     }
 
+    VkPhysicalDeviceProperties devProps{};
     PFN_vkGetPhysicalDeviceProperties pfnGetProps = 
-        (PFN_vkGetPhysicalDeviceProperties)nextGIPA(g_instance, "vkGetPhysicalDeviceProperties");
-    VkPhysicalDeviceProperties props{};
+        (PFN_vkGetPhysicalDeviceProperties)nextGIPA(VK_NULL_HANDLE, "vkGetPhysicalDeviceProperties");
     if (pfnGetProps) {
-        pfnGetProps(physicalDevice, &props);
+        pfnGetProps(physicalDevice, &devProps);
     }
 
-    ExtensionManager::Get().ResolveDeviceFunctions(*pDevice, nextGDPA);
+    float tsPeriod = (devProps.limits.timestampPeriod > 0.0f) ? devProps.limits.timestampPeriod : 1.0f;
+    Interceptor::Get().SetDeviceInfo(g_deviceMemoryProperties, g_graphicsQueueFamilyIndex, tsPeriod);
 
     DeviceDispatch dispatch{};
     dispatch.GetDeviceProcAddr = nextGDPA;
@@ -325,13 +294,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
         g_globalDeviceDispatch = dispatch;
     }
 
-    float tsPeriod = (props.limits.timestampPeriod > 0.0f) ? props.limits.timestampPeriod : 1.0f;
-    Interceptor::Get().SetDeviceInfo(g_deviceMemoryProperties, g_graphicsQueueFamilyIndex, tsPeriod);
-
     return VK_SUCCESS;
 }
 
-}
+} // namespace FrameFlux
 
 VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL FrameFlux_GetDeviceProcAddr(VkDevice device, const char* pName) {
     if (!pName) return nullptr;

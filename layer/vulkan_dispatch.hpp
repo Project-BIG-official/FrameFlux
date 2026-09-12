@@ -1,5 +1,5 @@
 // PB FrameFlux - LGPL-2.1
-// layer/vulkan_dispatch.hpp: Safe Layer-Internal Vulkan Dispatch Table (No libvulkan.so dependency)
+// layer/vulkan_dispatch.hpp: Safe Layer-Internal Vulkan Dispatch Table
 
 #pragma once
 
@@ -11,18 +11,15 @@
 namespace FrameFlux {
 
 struct DeviceDispatchTable {
-    // Core Device Functions
     PFN_vkGetDeviceProcAddr GetDeviceProcAddr = nullptr;
     PFN_vkDestroyDevice DestroyDevice = nullptr;
 
-    // Swapchain
     PFN_vkCreateSwapchainKHR CreateSwapchainKHR = nullptr;
     PFN_vkDestroySwapchainKHR DestroySwapchainKHR = nullptr;
     PFN_vkGetSwapchainImagesKHR GetSwapchainImagesKHR = nullptr;
     PFN_vkAcquireNextImageKHR AcquireNextImageKHR = nullptr;
     PFN_vkQueuePresentKHR QueuePresentKHR = nullptr;
 
-    // Memory & Images
     PFN_vkCreateImage CreateImage = nullptr;
     PFN_vkDestroyImage DestroyImage = nullptr;
     PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements = nullptr;
@@ -34,7 +31,6 @@ struct DeviceDispatchTable {
     PFN_vkCreateSampler CreateSampler = nullptr;
     PFN_vkDestroySampler DestroySampler = nullptr;
 
-    // Descriptors
     PFN_vkCreateDescriptorSetLayout CreateDescriptorSetLayout = nullptr;
     PFN_vkDestroyDescriptorSetLayout DestroyDescriptorSetLayout = nullptr;
     PFN_vkCreateDescriptorPool CreateDescriptorPool = nullptr;
@@ -42,7 +38,6 @@ struct DeviceDispatchTable {
     PFN_vkAllocateDescriptorSets AllocateDescriptorSets = nullptr;
     PFN_vkUpdateDescriptorSets UpdateDescriptorSets = nullptr;
 
-    // Pipelines & Shaders
     PFN_vkCreateShaderModule CreateShaderModule = nullptr;
     PFN_vkDestroyShaderModule DestroyShaderModule = nullptr;
     PFN_vkCreatePipelineLayout CreatePipelineLayout = nullptr;
@@ -50,7 +45,6 @@ struct DeviceDispatchTable {
     PFN_vkCreateComputePipelines CreateComputePipelines = nullptr;
     PFN_vkDestroyPipeline DestroyPipeline = nullptr;
 
-    // Commands & Synchronization
     PFN_vkCreateCommandPool CreateCommandPool = nullptr;
     PFN_vkDestroyCommandPool DestroyCommandPool = nullptr;
     PFN_vkAllocateCommandBuffers AllocateCommandBuffers = nullptr;
@@ -72,7 +66,6 @@ struct DeviceDispatchTable {
     PFN_vkDestroySemaphore DestroySemaphore = nullptr;
     PFN_vkQueueSubmit QueueSubmit = nullptr;
 
-    // Queries & Timestamps
     PFN_vkCreateQueryPool CreateQueryPool = nullptr;
     PFN_vkDestroyQueryPool DestroyQueryPool = nullptr;
     PFN_vkCmdResetQueryPool CmdResetQueryPool = nullptr;
@@ -80,6 +73,8 @@ struct DeviceDispatchTable {
     PFN_vkGetQueryPoolResults GetQueryPoolResults = nullptr;
 
     void Init(VkDevice device, PFN_vkGetDeviceProcAddr gdpa) {
+        if (!device || !gdpa) return;
+
         #define LOAD_DEV_FN(name) name = (PFN_vk##name)gdpa(device, "vk" #name)
         LOAD_DEV_FN(GetDeviceProcAddr);
         LOAD_DEV_FN(DestroyDevice);
