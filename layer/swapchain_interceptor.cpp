@@ -408,6 +408,7 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
     uint32_t w = data.extent.width;
     uint32_t h = data.extent.height;
 
+    std::cerr << "[PROBE 10] AllocateFrameBuffers w=" << w << " h=" << h << std::endl;
     if (w == 0 || h == 0) return false;
 
     uint32_t packedW = (w + 3) / 4;
@@ -422,20 +423,15 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
                         VkImage& outImg, VkDeviceMemory& outMem, VkImageView& outView) -> bool {
         VkImageCreateInfo imageInfo{};
         imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-        imageInfo.pNext = nullptr;
-        imageInfo.flags = 0;
-        imageInfo.imageType = VK_IMAGE_TYPE_2D;
         imageInfo.extent = {width, height, 1};
         imageInfo.mipLevels = 1;
         imageInfo.arrayLayers = 1;
         imageInfo.format = format;
         imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-        imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         imageInfo.usage = usage;
         imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        imageInfo.queueFamilyIndexCount = 0;
-        imageInfo.pQueueFamilyIndices = nullptr;
+        imageInfo.imageType = VK_IMAGE_TYPE_2D;
 
         if (!vk(data.device).CreateImage || vk(data.device).CreateImage(data.device, &imageInfo, nullptr, &outImg) != VK_SUCCESS) return false;
 
@@ -445,7 +441,6 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
 
         VkMemoryAllocateInfo allocInfo{};
         allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-        allocInfo.pNext = nullptr;
         allocInfo.allocationSize = memReqs.size;
         allocInfo.memoryTypeIndex = FindMemoryType(data.memoryProperties, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
@@ -454,16 +449,11 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
 
         VkImageViewCreateInfo viewInfo{};
         viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-        viewInfo.pNext = nullptr;
-        viewInfo.flags = 0;
         viewInfo.image = outImg;
         viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
         viewInfo.format = format;
-        viewInfo.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
         viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        viewInfo.subresourceRange.baseMipLevel = 0;
         viewInfo.subresourceRange.levelCount = 1;
-        viewInfo.subresourceRange.baseArrayLayer = 0;
         viewInfo.subresourceRange.layerCount = 1;
 
         if (!vk(data.device).CreateImageView || vk(data.device).CreateImageView(data.device, &viewInfo, nullptr, &outView) != VK_SUCCESS) return false;
@@ -476,15 +466,16 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
 
     VkImageUsageFlags sampledUsage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
 
+    std::cerr << "[PROBE 11] Allocating History Frames..." << std::endl;
     for (uint32_t i = 0; i < 2; ++i) {
         if (!allocTex(w, h, workingFormat, sampledUsage, data.historyFrames[i], data.historyFrameMemory[i], data.historyFrameViews[i])) return false;
         if (!allocTex(packedW, h, VK_FORMAT_R32_UINT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, data.historyLuma[i], data.historyLumaMemory[i], data.historyLumaViews[i])) return false;
         if (!allocTex(halfPackedW, halfH, VK_FORMAT_R32_UINT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, data.historyLumaHalf[i], data.historyLumaHalfMemory[i], data.historyLumaHalfViews[i])) return false;
     }
 
+    std::cerr << "[PROBE 12] Allocating Motion/Confidence textures..." << std::endl;
     VkImageUsageFlags storageUsage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (!allocTex(w, h, workingFormat, storageUsage, data.generatedImage, data.generatedMemory, data.generatedView)) return false;
-
     if (!allocTex(1, 1, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, data.dummyCoarseImage, data.dummyCoarseMemory, data.dummyCoarseView)) return false;
     if (!allocTex(halfPackedW, halfBlockGridH, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT, data.coarseMotionImage, data.coarseMotionMemory, data.coarseMotionView)) return false;
     if (!allocTex(packedW, blockGridH, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT, data.motionImage, data.motionMemory, data.motionView)) return false;
@@ -492,27 +483,17 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
 
     data.totalAllocatedVramMb = static_cast<uint32_t>(totalAllocatedBytes / (1024 * 1024));
 
+    std::cerr << "[PROBE 13] Creating Sampler..." << std::endl;
     VkSamplerCreateInfo samplerInfo{};
     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-    samplerInfo.pNext = nullptr;
-    samplerInfo.flags = 0;
     samplerInfo.magFilter = VK_FILTER_LINEAR;
     samplerInfo.minFilter = VK_FILTER_LINEAR;
-    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
     samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    samplerInfo.mipLodBias = 0.0f;
-    samplerInfo.anisotropyEnable = VK_FALSE;
-    samplerInfo.maxAnisotropy = 1.0f;
-    samplerInfo.compareEnable = VK_FALSE;
-    samplerInfo.compareOp = VK_COMPARE_OP_ALWAYS;
-    samplerInfo.minLod = 0.0f;
-    samplerInfo.maxLod = 0.0f;
-    samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
-    samplerInfo.unnormalizedCoordinates = VK_FALSE;
-    vk(data.device).CreateSampler(data.device, &samplerInfo, nullptr, &data.linearSampler);
+    if (!vk(data.device).CreateSampler || vk(data.device).CreateSampler(data.device, &samplerInfo, nullptr, &data.linearSampler) != VK_SUCCESS) return false;
 
+    std::cerr << "[PROBE 14] Creating Descriptor Pool..." << std::endl;
     std::vector<VkDescriptorPoolSize> poolSizes = {
         {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 48},
         {VK_DESCRIPTOR_TYPE_SAMPLER, 8},
@@ -520,23 +501,23 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
     };
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    poolInfo.pNext = nullptr;
-    poolInfo.flags = 0;
     poolInfo.maxSets = 24;
     poolInfo.poolSizeCount = (uint32_t)poolSizes.size();
     poolInfo.pPoolSizes = poolSizes.data();
-    vk(data.device).CreateDescriptorPool(data.device, &poolInfo, nullptr, &data.descriptorPool);
+    if (!vk(data.device).CreateDescriptorPool || vk(data.device).CreateDescriptorPool(data.device, &poolInfo, nullptr, &data.descriptorPool) != VK_SUCCESS) return false;
 
     auto allocSet = [&](VkDescriptorSetLayout layout, VkDescriptorSet& outSet) {
         VkDescriptorSetAllocateInfo allocSetInfo{};
         allocSetInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        allocSetInfo.pNext = nullptr;
         allocSetInfo.descriptorPool = data.descriptorPool;
         allocSetInfo.descriptorSetCount = 1;
         allocSetInfo.pSetLayouts = &layout;
-        vk(data.device).AllocateDescriptorSets(data.device, &allocSetInfo, &outSet);
+        if (vk(data.device).AllocateDescriptorSets) {
+            vk(data.device).AllocateDescriptorSets(data.device, &allocSetInfo, &outSet);
+        }
     };
 
+    std::cerr << "[PROBE 15] Allocating Descriptor Sets..." << std::endl;
     for (uint32_t p = 0; p < 2; ++p) {
         allocSet(m_computeEngine.GetLumaDescLayout(), data.lumaDescSet[p]);
         allocSet(m_computeEngine.GetDownsampleDescLayout(), data.downsampleDescSet[p]);
@@ -547,6 +528,7 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
     }
     allocSet(m_computeEngine.GetOverlayDescLayout(), data.overlayDescSet);
 
+    std::cerr << "[PROBE 16] Updating Descriptor Sets..." << std::endl;
     for (uint32_t curr = 0; curr < 2; ++curr) {
         uint32_t prev = 1 - curr;
 
@@ -557,7 +539,7 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
         VkWriteDescriptorSet lumaWrites[2]{};
         lumaWrites[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, data.lumaDescSet[curr], 0, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &lumaImgs[0], nullptr, nullptr};
         lumaWrites[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, data.lumaDescSet[curr], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &lumaImgs[1], nullptr, nullptr};
-        vk(data.device).UpdateDescriptorSets(data.device, 2, lumaWrites, 0, nullptr);
+        if (vk(data.device).UpdateDescriptorSets) vk(data.device).UpdateDescriptorSets(data.device, 2, lumaWrites, 0, nullptr);
 
         VkDescriptorImageInfo downImgs[2]{
             {VK_NULL_HANDLE, data.historyLumaViews[curr],     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
@@ -566,7 +548,7 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
         VkWriteDescriptorSet downWrites[2]{};
         downWrites[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, data.downsampleDescSet[curr], 0, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &downImgs[0], nullptr, nullptr};
         downWrites[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, data.downsampleDescSet[curr], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &downImgs[1], nullptr, nullptr};
-        vk(data.device).UpdateDescriptorSets(data.device, 2, downWrites, 0, nullptr);
+        if (vk(data.device).UpdateDescriptorSets) vk(data.device).UpdateDescriptorSets(data.device, 2, downWrites, 0, nullptr);
 
         VkDescriptorImageInfo coarseImgs[5]{
             {VK_NULL_HANDLE, data.historyLumaHalfViews[prev], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
@@ -579,7 +561,7 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
         for (uint32_t i = 0; i < 5; ++i) {
             coarseWrites[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, data.coarseFlowDescSet[curr], i, 0, 1, (i >= 3) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &coarseImgs[i], nullptr, nullptr};
         }
-        vk(data.device).UpdateDescriptorSets(data.device, 5, coarseWrites, 0, nullptr);
+        if (vk(data.device).UpdateDescriptorSets) vk(data.device).UpdateDescriptorSets(data.device, 5, coarseWrites, 0, nullptr);
 
         VkDescriptorImageInfo refineImgs[5]{
             {VK_NULL_HANDLE, data.historyLumaViews[prev], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
@@ -592,7 +574,7 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
         for (uint32_t i = 0; i < 5; ++i) {
             refineWrites[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, data.refineDescSet[curr], i, 0, 1, (i >= 3) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &refineImgs[i], nullptr, nullptr};
         }
-        vk(data.device).UpdateDescriptorSets(data.device, 5, refineWrites, 0, nullptr);
+        if (vk(data.device).UpdateDescriptorSets) vk(data.device).UpdateDescriptorSets(data.device, 5, refineWrites, 0, nullptr);
 
         VkDescriptorImageInfo directImgs[5]{
             {VK_NULL_HANDLE, data.historyLumaViews[prev], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
@@ -605,7 +587,7 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
         for (uint32_t i = 0; i < 5; ++i) {
             directWrites[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, data.directFlowDescSet[curr], i, 0, 1, (i >= 3) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &directImgs[i], nullptr, nullptr};
         }
-        vk(data.device).UpdateDescriptorSets(data.device, 5, directWrites, 0, nullptr);
+        if (vk(data.device).UpdateDescriptorSets) vk(data.device).UpdateDescriptorSets(data.device, 5, directWrites, 0, nullptr);
 
         VkDescriptorImageInfo warpImgs[6]{
             {VK_NULL_HANDLE, data.historyFrameViews[prev], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
@@ -619,44 +601,46 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
         for (uint32_t i = 0; i < 6; ++i) {
             warpWrites[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, data.warpDescSet[curr], i, 0, 1, (i == 4) ? VK_DESCRIPTOR_TYPE_SAMPLER : ((i == 5) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE), &warpImgs[i], nullptr, nullptr};
         }
-        vk(data.device).UpdateDescriptorSets(data.device, 6, warpWrites, 0, nullptr);
+        if (vk(data.device).UpdateDescriptorSets) vk(data.device).UpdateDescriptorSets(data.device, 6, warpWrites, 0, nullptr);
     }
 
     VkDescriptorImageInfo overlayImg{VK_NULL_HANDLE, data.generatedView, VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet overlayWrite{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, data.overlayDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &overlayImg, nullptr, nullptr};
-    vk(data.device).UpdateDescriptorSets(data.device, 1, &overlayWrite, 0, nullptr);
+    if (vk(data.device).UpdateDescriptorSets) vk(data.device).UpdateDescriptorSets(data.device, 1, &overlayWrite, 0, nullptr);
 
+    std::cerr << "[PROBE 17] Allocating Command Buffers..." << std::endl;
     VkCommandBufferAllocateInfo cmdAllocInfo{};
     cmdAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    cmdAllocInfo.pNext = nullptr;
     cmdAllocInfo.commandPool = data.commandPool;
     cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     cmdAllocInfo.commandBufferCount = MAX_MULTIPLIER_FRAMES + 1;
 
     VkSemaphoreCreateInfo semInfo{};
     semInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-    semInfo.pNext = nullptr;
-    semInfo.flags = 0;
 
     VkFenceCreateInfo fenceInfo{};
     fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    fenceInfo.pNext = nullptr;
     fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
 
     for (uint32_t slot = 0; slot < MAX_FRAMES_IN_FLIGHT; ++slot) {
         std::vector<VkCommandBuffer> bufs(MAX_MULTIPLIER_FRAMES + 1);
-        vk(data.device).AllocateCommandBuffers(data.device, &cmdAllocInfo, bufs.data());
+        if (vk(data.device).AllocateCommandBuffers) {
+            vk(data.device).AllocateCommandBuffers(data.device, &cmdAllocInfo, bufs.data());
+        }
         for (uint32_t m = 0; m < MAX_MULTIPLIER_FRAMES; ++m) {
             data.frameSlots[slot].genCommandBuffers[m] = bufs[m];
-            vk(data.device).CreateSemaphore(data.device, &semInfo, nullptr, &data.frameSlots[slot].genDoneSemaphores[m]);
-            vk(data.device).CreateSemaphore(data.device, &semInfo, nullptr, &data.frameSlots[slot].acquireSemaphores[m]);
+            if (vk(data.device).CreateSemaphore) {
+                vk(data.device).CreateSemaphore(data.device, &semInfo, nullptr, &data.frameSlots[slot].genDoneSemaphores[m]);
+                vk(data.device).CreateSemaphore(data.device, &semInfo, nullptr, &data.frameSlots[slot].acquireSemaphores[m]);
+            }
         }
         data.frameSlots[slot].realCommandBuffer = bufs[MAX_MULTIPLIER_FRAMES];
 
-        vk(data.device).CreateFence(data.device, &fenceInfo, nullptr, &data.frameSlots[slot].frameFence);
-        vk(data.device).CreateSemaphore(data.device, &semInfo, nullptr, &data.frameSlots[slot].realDoneSemaphore);
+        if (vk(data.device).CreateFence) vk(data.device).CreateFence(data.device, &fenceInfo, nullptr, &data.frameSlots[slot].frameFence);
+        if (vk(data.device).CreateSemaphore) vk(data.device).CreateSemaphore(data.device, &semInfo, nullptr, &data.frameSlots[slot].realDoneSemaphore);
     }
 
+    std::cerr << "[PROBE 18] AllocateFrameBuffers Complete!" << std::endl;
     data.buffersAllocated = true;
     data.historyInitialized = false;
     return true;
@@ -713,11 +697,14 @@ VkResult Interceptor::OnCreateSwapchainKHR(
     VkSwapchainKHR* pSwapchain,
     PFN_vkCreateSwapchainKHR realFunc
 ) {
+    std::cerr << "[PROBE 1] OnCreateSwapchainKHR started" << std::endl;
     if (!device || !pCreateInfo || !pSwapchain || !realFunc) {
+        std::cerr << "[PROBE ERROR] Null pointer passed to OnCreateSwapchainKHR" << std::endl;
         return VK_ERROR_INITIALIZATION_FAILED;
     }
 
     SettingsManager::Get().LoadOrCreate();
+    std::cerr << "[PROBE 2] Settings loaded" << std::endl;
 
     VkSwapchainCreateInfoKHR modifiedCreateInfo = *pCreateInfo;
     modifiedCreateInfo.imageUsage |= (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
@@ -726,13 +713,20 @@ VkResult Interceptor::OnCreateSwapchainKHR(
         modifiedCreateInfo.minImageCount = std::max(modifiedCreateInfo.minImageCount + 2u, 5u);
     }
 
+    std::cerr << "[PROBE 3] Calling realFunc..." << std::endl;
     VkResult result = realFunc(device, &modifiedCreateInfo, pAllocator, pSwapchain);
     if (result != VK_SUCCESS) {
+        std::cerr << "[PROBE 3.1] realFunc failed with modifiedCreateInfo (" << result << "), trying original..." << std::endl;
         result = realFunc(device, pCreateInfo, pAllocator, pSwapchain);
-        if (result != VK_SUCCESS) return result;
+        if (result != VK_SUCCESS) {
+            std::cerr << "[PROBE ERROR] realFunc failed permanently: " << result << std::endl;
+            return result;
+        }
     }
+    std::cerr << "[PROBE 4] Swapchain created: " << *pSwapchain << std::endl;
 
     if (!m_computeEngineInitialized || m_cachedDevice != device) {
+        std::cerr << "[PROBE 5] Initializing Compute Engine..." << std::endl;
         m_computeEngine.Cleanup();
         m_computeEngine.Initialize(device, m_cachedTimestampPeriod);
         m_computeEngineInitialized = true;
@@ -749,28 +743,36 @@ VkResult Interceptor::OnCreateSwapchainKHR(
     data->lastPresentTime = std::chrono::high_resolution_clock::now();
     data->lastPresentExitTime = std::chrono::high_resolution_clock::now();
 
+    std::cerr << "[PROBE 6] Getting Swapchain Images..." << std::endl;
     uint32_t imageCount = 0;
     if (vk(device).GetSwapchainImagesKHR) {
         vk(device).GetSwapchainImagesKHR(device, *pSwapchain, &imageCount, nullptr);
+        std::cerr << "[PROBE 7] ImageCount = " << imageCount << std::endl;
         if (imageCount == 0) return VK_SUCCESS;
 
         data->realImages.resize(imageCount);
         vk(device).GetSwapchainImagesKHR(device, *pSwapchain, &imageCount, data->realImages.data());
+    } else {
+        std::cerr << "[PROBE ERROR] GetSwapchainImagesKHR function pointer is NULL!" << std::endl;
     }
 
+    std::cerr << "[PROBE 8] Creating Command Pool..." << std::endl;
     VkCommandPoolCreateInfo cmdPoolInfo{};
     cmdPoolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    cmdPoolInfo.pNext = nullptr;
     cmdPoolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     cmdPoolInfo.queueFamilyIndex = m_cachedQueueFamily;
     
     if (vk(device).CreateCommandPool) {
         vk(device).CreateCommandPool(device, &cmdPoolInfo, nullptr, &data->commandPool);
+    } else {
+        std::cerr << "[PROBE ERROR] CreateCommandPool function pointer is NULL!" << std::endl;
     }
 
+    std::cerr << "[PROBE 9] Entering AllocateFrameBuffers..." << std::endl;
     AllocateFrameBuffers(*data);
 
     m_swapchains[*pSwapchain] = std::move(data);
+    std::cerr << "[PROBE 20] OnCreateSwapchainKHR SUCCESS!" << std::endl;
     return VK_SUCCESS;
 }
 
