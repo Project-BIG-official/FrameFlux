@@ -29,20 +29,30 @@ void SettingsManager::SaveToFile() {
     std::ofstream outFile(m_activeConfigPath);
     if (!outFile.is_open()) return;
 
-    outFile << "# PB FrameFlux Configuration File\n"
-            << "# Auto-generated & synced on launch. Edit parameters to customize.\n\n"
+    outFile << "# PB FrameFlux Configuration File\n\n"
             << "[general]\n"
-            << "mode = " << m_settings.mode << "\n\n"
-            << "profile = " << m_settings.profile << "\n\n"
-            << "multiplier = " << m_settings.multiplier << "\n\n"
-            << "scheduler_mode = " << m_settings.schedulerMode << "\n\n"
-            << "target_fps = " << m_settings.targetFps << "\n\n"
-            << "[quality]\n"
-            << "search_mode = " << m_settings.searchMode << "\n\n"
-            << "fallback_action = " << m_settings.fallbackAction << "\n\n"
+            << "mode = " << m_settings.mode << "\n"
+            << "profile = " << m_settings.profile << "\n"
+            << "multiplier = " << m_settings.multiplier << "\n"
+            << "scheduler_mode = " << m_settings.schedulerMode << "\n"
+            << "target_fps = " << m_settings.targetFps << "\n"
+            << "low_latency = " << m_settings.lowLatency << "\n\n"
             << "[hud]\n"
-            << "show_hud = " << (m_settings.showWatermark ? "true" : "false") << "\n\n"
-            << "hud_corner = " << m_settings.hudCorner << "\n";
+            << "hud_mode = " << m_settings.hudMode << "\n"
+            << "hud_corner = " << m_settings.hudCorner << "\n\n"
+            << "[debug]\n"
+            << "debug_mode = " << (m_settings.isDebugMode ? "true" : "false") << "\n"
+            << "search_mode = " << m_settings.searchMode << "\n"
+            << "fallback_action = " << m_settings.fallbackAction << "\n"
+            << "force_fallback = " << m_settings.forceFallback << "\n"
+            << "debug_visual = " << m_settings.debugVisual << "\n"
+            << "conf_override = " << m_settings.confOverride << "\n"
+            << "stride_override = " << m_settings.strideOverride << "\n"
+            << "ext_present_wait = " << m_settings.extPresentWait << "\n"
+            << "ext_low_latency = " << m_settings.extLowLatency << "\n"
+            << "ext_display_timing = " << m_settings.extDisplayTiming << "\n"
+            << "ext_timestamps = " << m_settings.extTimestamps << "\n"
+            << "enable_pacing = " << (m_settings.enablePacingWait ? "true" : "false") << "\n";
     outFile.close();
 
     try {
@@ -80,10 +90,23 @@ void SettingsManager::SyncAndLoadFile(const std::string& path) {
     m_settings.multiplier = std::clamp((uint32_t)atoi(getOrDef("multiplier", "2").c_str()), 2u, 6u);
     m_settings.schedulerMode = getOrDef("scheduler_mode", "auto");
     m_settings.targetFps = (uint32_t)atoi(getOrDef("target_fps", "0").c_str());
+    m_settings.lowLatency = getOrDef("low_latency", "on");
+    m_settings.hudMode = std::clamp((uint32_t)atoi(getOrDef("hud_mode", "2").c_str()), 0u, 3u);
+    m_settings.hudCorner = std::clamp((uint32_t)atoi(getOrDef("hud_corner", "0").c_str()), 0u, 3u);
     m_settings.searchMode = getOrDef("search_mode", "high");
     m_settings.fallbackAction = getOrDef("fallback_action", "repeat");
-    m_settings.showWatermark = (getOrDef("show_hud", "false") == "true" || getOrDef("show_watermark", "false") == "true");
-    m_settings.hudCorner = std::clamp((uint32_t)atoi(getOrDef("hud_corner", "0").c_str()), 0u, 3u);
+
+    // Debug
+    m_settings.isDebugMode = (getOrDef("debug_mode", "false") == "true");
+    m_settings.forceFallback = getOrDef("force_fallback", "auto");
+    m_settings.debugVisual = (uint32_t)atoi(getOrDef("debug_visual", "0").c_str());
+    m_settings.confOverride = (float)atof(getOrDef("conf_override", "0.0").c_str());
+    m_settings.strideOverride = (uint32_t)atoi(getOrDef("stride_override", "0").c_str());
+    m_settings.extPresentWait = (uint32_t)atoi(getOrDef("ext_present_wait", "0").c_str());
+    m_settings.extLowLatency = (uint32_t)atoi(getOrDef("ext_low_latency", "0").c_str());
+    m_settings.extDisplayTiming = (uint32_t)atoi(getOrDef("ext_display_timing", "0").c_str());
+    m_settings.extTimestamps = (uint32_t)atoi(getOrDef("ext_timestamps", "0").c_str());
+    m_settings.enablePacingWait = (getOrDef("enable_pacing", "true") == "true");
 
     SaveToFile();
 }
@@ -98,7 +121,6 @@ void SettingsManager::CheckHotReload() {
             return;
         }
 
-        // Only reload from disk if external editor changed the file (do NOT reapply env overrides)
         if (currentWriteTime > m_lastConfigWriteTime) {
             m_lastConfigWriteTime = currentWriteTime;
             SyncAndLoadFile(m_activeConfigPath);
@@ -123,7 +145,6 @@ void SettingsManager::LoadOrCreate() {
     }
 
     SyncAndLoadFile(m_activeConfigPath);
-    // Environment variables only set initial values on first launch
     ApplyEnvironmentOverrides();
 }
 
@@ -139,6 +160,11 @@ void SettingsManager::ApplyEnvironmentOverrides() {
         }
     }
 
+    const char* envDebug = getenv("FRAMEFLUX_DEBUG");
+    if (envDebug && (strcmp(envDebug, "1") == 0 || strcasecmp(envDebug, "true") == 0)) {
+        m_settings.isDebugMode = true;
+    }
+
     const char* envProfile = getenv("FRAMEFLUX_PROFILE");
     if (envProfile) m_settings.profile = envProfile;
 
@@ -148,17 +174,8 @@ void SettingsManager::ApplyEnvironmentOverrides() {
         if (m >= 2 && m <= 6) m_settings.multiplier = (uint32_t)m;
     }
 
-    const char* envSched = getenv("FRAMEFLUX_SCHEDULER");
-    if (envSched) m_settings.schedulerMode = envSched;
-
     const char* envFps = getenv("FRAMEFLUX_TARGET_FPS");
     if (envFps) m_settings.targetFps = (uint32_t)atoi(envFps);
-
-    const char* envSearch = getenv("FRAMEFLUX_SEARCH_MODE");
-    if (envSearch) m_settings.searchMode = envSearch;
-
-    const char* envFallback = getenv("FRAMEFLUX_FALLBACK");
-    if (envFallback) m_settings.fallbackAction = envFallback;
 }
 
 } // namespace FrameFlux

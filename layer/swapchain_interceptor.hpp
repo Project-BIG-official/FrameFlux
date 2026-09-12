@@ -1,5 +1,5 @@
 // PB FrameFlux - LGPL-2.1
-// layer/swapchain_interceptor.hpp: Complete Header with True Fractional Multiplier & Telemetry
+// layer/swapchain_interceptor.hpp: Multi-Frame Scalable Ring Synchronization with Zero-Copy Ping-Pong
 
 #pragma once
 
@@ -46,43 +46,31 @@ struct SwapchainData {
     std::vector<VkImage> realImages;
 
     bool buffersAllocated = false;
+    bool historyInitialized = false;
     FrameFluxMode mode = FrameFluxMode::TrueFGV2;
     FrametimeSmoother smoother;
 
     VkCommandPool commandPool = VK_NULL_HANDLE;
 
-    // Flight ring buffer resources
     FrameFlightResources frameSlots[MAX_FRAMES_IN_FLIGHT];
     uint32_t currentFlightSlot = 0;
 
-    // Full-Res RGBA Frame history
-    VkImage frameAImage = VK_NULL_HANDLE;
-    VkDeviceMemory frameAMemory = VK_NULL_HANDLE;
-    VkImageView frameAView = VK_NULL_HANDLE;
+    // -------------------------------------------------------------------------
+    // Zero-Copy Ping-Pong Ring Buffers: Index 0 and Index 1
+    // -------------------------------------------------------------------------
+    VkImage historyFrames[2]{VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkDeviceMemory historyFrameMemory[2]{VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkImageView historyFrameViews[2]{VK_NULL_HANDLE, VK_NULL_HANDLE};
 
-    VkImage frameBImage = VK_NULL_HANDLE;
-    VkDeviceMemory frameBMemory = VK_NULL_HANDLE;
-    VkImageView frameBView = VK_NULL_HANDLE;
+    VkImage historyLuma[2]{VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkDeviceMemory historyLumaMemory[2]{VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkImageView historyLumaViews[2]{VK_NULL_HANDLE, VK_NULL_HANDLE};
 
-    // Full-Res Luma textures
-    VkImage lumaAImage = VK_NULL_HANDLE;
-    VkDeviceMemory lumaAMemory = VK_NULL_HANDLE;
-    VkImageView lumaAView = VK_NULL_HANDLE;
+    VkImage historyLumaHalf[2]{VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkDeviceMemory historyLumaHalfMemory[2]{VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkImageView historyLumaHalfViews[2]{VK_NULL_HANDLE, VK_NULL_HANDLE};
 
-    VkImage lumaBImage = VK_NULL_HANDLE;
-    VkDeviceMemory lumaBMemory = VK_NULL_HANDLE;
-    VkImageView lumaBView = VK_NULL_HANDLE;
-
-    // Half-Res Pyramid Luma textures
-    VkImage lumaAHalfImage = VK_NULL_HANDLE;
-    VkDeviceMemory lumaAHalfMemory = VK_NULL_HANDLE;
-    VkImageView lumaAHalfView = VK_NULL_HANDLE;
-
-    VkImage lumaBHalfImage = VK_NULL_HANDLE;
-    VkDeviceMemory lumaBHalfMemory = VK_NULL_HANDLE;
-    VkImageView lumaBHalfView = VK_NULL_HANDLE;
-
-    // Motion and Confidence textures
+    // Shared intermediate motion & generation textures
     VkImage dummyCoarseImage = VK_NULL_HANDLE;
     VkDeviceMemory dummyCoarseMemory = VK_NULL_HANDLE;
     VkImageView dummyCoarseView = VK_NULL_HANDLE;
@@ -99,34 +87,31 @@ struct SwapchainData {
     VkDeviceMemory confidenceMemory = VK_NULL_HANDLE;
     VkImageView confidenceView = VK_NULL_HANDLE;
 
-    // Output Generated Frame
     VkImage generatedImage = VK_NULL_HANDLE;
     VkDeviceMemory generatedMemory = VK_NULL_HANDLE;
     VkImageView generatedView = VK_NULL_HANDLE;
 
-    // Sampler & Descriptors
     VkSampler linearSampler = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
 
-    VkDescriptorSet lumaDescSet = VK_NULL_HANDLE;
-    VkDescriptorSet downsampleDescSet = VK_NULL_HANDLE;
-    VkDescriptorSet coarseFlowDescSet = VK_NULL_HANDLE;
-    VkDescriptorSet refineDescSet = VK_NULL_HANDLE;
-    VkDescriptorSet directFlowDescSet = VK_NULL_HANDLE;
-    VkDescriptorSet warpDescSet = VK_NULL_HANDLE;
+    // Dual Ping-Pong pre-baked Descriptor Sets (Parity 0 and Parity 1)
+    VkDescriptorSet lumaDescSet[2]{VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkDescriptorSet downsampleDescSet[2]{VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkDescriptorSet coarseFlowDescSet[2]{VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkDescriptorSet refineDescSet[2]{VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkDescriptorSet directFlowDescSet[2]{VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkDescriptorSet warpDescSet[2]{VK_NULL_HANDLE, VK_NULL_HANDLE};
     VkDescriptorSet overlayDescSet = VK_NULL_HANDLE;
 
-    // Timing metrics
     std::chrono::high_resolution_clock::time_point lastPresentTime;
-    std::chrono::high_resolution_clock::time_point lastPresentExitTime; // Pure game render clock
+    std::chrono::high_resolution_clock::time_point lastPresentExitTime;
     float smoothedFrametimeMs = 16.6f;
+    float smoothedOutputFps = 60.0f;
     uint32_t frameCounter = 0;
     uint32_t totalAllocatedVramMb = 0;
     float lastCpuTimeMs = 0.05f;
     float lastGpuTimeMs = 1.2f;
-    float smoothedOutputFps = 60.0f;
 
-    // Fractional Phase Accumulator (True Non-Integer Multiplier)
     float fractionalDebt = 0.0f;
 };
 
@@ -134,10 +119,10 @@ class Interceptor {
 public:
     static Interceptor& Get();
 
-    void SetDeviceInfo(const VkPhysicalDeviceMemoryProperties& memProps, uint32_t queueFamily, VkPhysicalDevice physDev = VK_NULL_HANDLE) {
+    void SetDeviceInfo(const VkPhysicalDeviceMemoryProperties& memProps, uint32_t queueFamily, float timestampPeriod) {
         m_cachedMemProps = memProps;
         m_cachedQueueFamily = queueFamily;
-        m_cachedPhysicalDevice = physDev;
+        m_cachedTimestampPeriod = (timestampPeriod > 0.0f) ? timestampPeriod : 1.0f;
     }
 
     VkResult OnCreateSwapchainKHR(
@@ -162,16 +147,13 @@ public:
     );
 
 private:
-    Interceptor() = default;
-    ~Interceptor() = default;
-
     std::unordered_map<VkSwapchainKHR, std::unique_ptr<SwapchainData>> m_swapchains;
     ComputeEngine m_computeEngine;
     bool m_computeEngineInitialized = false;
 
     VkPhysicalDeviceMemoryProperties m_cachedMemProps{};
     uint32_t m_cachedQueueFamily = 0;
-    VkPhysicalDevice m_cachedPhysicalDevice = VK_NULL_HANDLE;
+    float m_cachedTimestampPeriod = 1.0f;
 
     bool AllocateFrameBuffers(SwapchainData& data);
     void CleanupSwapchainData(SwapchainData& data);

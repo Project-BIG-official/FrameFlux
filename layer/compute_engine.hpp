@@ -49,27 +49,40 @@ struct LumaPushConstants {
 };
 
 struct OverlayPushConstants {
-    uint32_t resolutionX;    // Offset 0
-    uint32_t resolutionY;    // Offset 4
-    uint32_t isMenuOpen;     // Offset 8
-    uint32_t isHudVisible;   // Offset 12
-    uint32_t selectedItem;   // Offset 16
-    uint32_t mode;           // Offset 20
-    uint32_t multiplier;     // Offset 24
-    uint32_t profile;        // Offset 28
-    uint32_t searchMode;     // Offset 32
-    uint32_t schedulerMode;  // Offset 36
-    uint32_t targetFps;      // Offset 40
-    uint32_t fallbackAction; // Offset 44
-    uint32_t hudCorner;      // Offset 48
-    uint32_t nativeFpsX10;   // Offset 52
-    uint32_t outputFpsX10;   // Offset 56
-    uint32_t gpuTimeUs;      // Offset 60
-    uint32_t cpuTimeUs;      // Offset 64
-    uint32_t latencyUs;      // Offset 68
-    uint32_t confidenceX10;  // Offset 72
-    uint32_t fallbackX10;    // Offset 76
-    uint32_t vramMb;         // Offset 80
+    uint32_t resolutionX;       // Offset 0
+    uint32_t resolutionY;       // Offset 4
+    uint32_t isMenuOpen;        // Offset 8
+    uint32_t hudMode;           // Offset 12 
+    uint32_t selectedItem;      // Offset 16
+    uint32_t mode;              // Offset 20
+    uint32_t multiplier;        // Offset 24
+    uint32_t profile;           // Offset 28
+    uint32_t searchMode;        // Offset 32
+    uint32_t lowLatency;        // Offset 36 
+    uint32_t schedulerMode;     // Offset 40
+    uint32_t targetFps;         // Offset 44
+    uint32_t fallbackAction;    // Offset 48
+    uint32_t hudCorner;         // Offset 52
+    uint32_t nativeFpsX10;      // Offset 56
+    uint32_t outputFpsX10;      // Offset 60
+    uint32_t gpuTimeUs;         // Offset 64
+    uint32_t cpuTimeUs;         // Offset 68
+    uint32_t latencyUs;         // Offset 72
+    uint32_t confidenceX10;     // Offset 76
+    uint32_t fallbackX10;       // Offset 80
+    uint32_t vramMb;            // Offset 84
+    uint32_t displayHz;         // Offset 88
+    uint32_t isDebugMode;       // Offset 92
+
+    // Advanced Debug Slots (32 байта)
+    uint32_t menuPage;          // Offset 96:  0 = Main, 1 = Debug
+    uint32_t extPresentWait;    // Offset 100: 0 = Auto, 1 = Wait2, 2 = Wait1, 3 = Disabled
+    uint32_t extLowLatency;     // Offset 104: 0 = Auto, 1 = AntiLag, 2 = Reflex, 3 = JIT, 4 = Off
+    uint32_t extDisplayTiming;  // Offset 108: 0 = Auto, 1 = EXT, 2 = Google, 3 = Sysfs, 4 = Fixed
+    uint32_t extTimestamps;     // Offset 112: 0 = Auto, 1 = KHR, 2 = EXT, 3 = QueryPool
+    uint32_t forceFallback;     // Offset 116: 0 = Auto, 1 = Repeat, 2 = Blend, 3 = Drop
+    uint32_t debugVisual;       // Offset 120: 0 = Off, 1 = Badge, 2 = Conf Map, 3 = Flow Vectors
+    uint32_t strideAndConf;     // Offset 124: byte 0 = Stride, byte 1 = Conf, byte 2 = SwapchainMaint
 };
 
 class ComputeEngine {
@@ -77,7 +90,7 @@ public:
     ComputeEngine() = default;
     ~ComputeEngine();
 
-    bool Initialize(VkDevice device, VkPhysicalDevice physicalDevice);
+    bool Initialize(VkDevice device, float timestampPeriod = 1.0f);
     void Cleanup();
 
     void RecordLumaPass(VkCommandBuffer cmd, VkDescriptorSet descSet, uint32_t width, uint32_t height);
@@ -141,7 +154,6 @@ private:
     bool CreateRefinePipeline();
     bool CreateWarpPipeline();
     bool CreateOverlayPipeline();
-    void InitQueryPool(VkPhysicalDevice physicalDevice);
 };
 
 } // namespace FrameFlux

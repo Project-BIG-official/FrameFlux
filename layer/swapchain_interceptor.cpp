@@ -1,28 +1,32 @@
 // PB FrameFlux - LGPL-2.1
-// layer/swapchain_interceptor.cpp: Rock-Solid Fractional Telemetry & Smooth HUD Engine
-
-#include "swapchain_interceptor.hpp"
-#include "settings.hpp"
-#include "hotkey_manager.hpp"
+// layer/swapchain_interceptor.cpp: Safe High-Multiplier & Independent Target FPS Interceptor
 
 #include <algorithm>
 #include <iostream>
 #include <fstream>
-#include <thread>
 #include <vector>
 #include <cmath>
+#include <chrono>
+#include <string>
+#include <memory>
 #include <unistd.h>
+
+#include "swapchain_interceptor.hpp"
+#include "compute_engine.hpp"
+#include "settings.hpp"
+#include "hotkey_manager.hpp"
+#include "vulkan_extensions.hpp"
 
 namespace FrameFlux {
 
 static uint32_t GetLiveProcessMemoryMb(uint32_t fallbackBaseMb) {
-    std::ifstream statm("/proc/self/statm");
+    ::std::ifstream statm("/proc/self/statm");
     if (statm.is_open()) {
         unsigned long totalPages, residentPages;
         if (statm >> totalPages >> residentPages) {
             long pageSize = sysconf(_SC_PAGESIZE);
             uint32_t residentMb = static_cast<uint32_t>((residentPages * pageSize) / (1024 * 1024));
-            return std::max(residentMb, fallbackBaseMb);
+            return ::std::max(residentMb, fallbackBaseMb);
         }
     }
     return fallbackBaseMb;
@@ -71,10 +75,6 @@ static void TransitionImage(
     vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 }
 
-// -----------------------------------------------------------------------------
-// Live Telemetry Pass (Rock-Solid Fractional Output Metric)
-// -----------------------------------------------------------------------------
-
 static void RecordHudOverlay(
     SwapchainData& data,
     VkCommandBuffer cmd,
@@ -99,13 +99,12 @@ static void RecordHudOverlay(
     uint32_t gpuUs = static_cast<uint32_t>(data.lastGpuTimeMs * 1000.0f);
     uint32_t cpuUs = static_cast<uint32_t>(data.lastCpuTimeMs * 1000.0f);
     
-    // Subframe pacing interval
     float outputFpsFloat = static_cast<float>(honestOutputFpsX10) / 10.0f;
     float pacingMs = (outputFpsFloat > 1.0f) ? (1000.0f / outputFpsFloat) : frametimeMs;
     uint32_t latUs = static_cast<uint32_t>(pacingMs * 1000.0f);
 
-    float jitter = std::abs(currentFrameDeltaMs - frametimeMs);
-    float stabilityFactor = std::clamp(1.0f - (jitter / 18.0f), 0.72f, 1.0f);
+    float jitter = ::std::abs(currentFrameDeltaMs - frametimeMs);
+    float stabilityFactor = ::std::clamp(1.0f - (jitter / 18.0f), 0.72f, 1.0f);
     float modeBase = (cfg.mode == "v2") ? 0.988f : 0.999f;
     float liveConfidence = modeBase * stabilityFactor;
     float liveFallback = (1.0f - liveConfidence) * 1.8f;
@@ -118,18 +117,37 @@ static void RecordHudOverlay(
     uint32_t modeCode = (cfg.mode == "off") ? 0 : ((cfg.mode == "v1") ? 1 : 2);
     uint32_t profCode = (cfg.profile == "quality") ? 1 : 0;
     uint32_t searchCode = (cfg.searchMode == "high") ? 1 : 0;
-    uint32_t schedCode = (cfg.schedulerMode == "fixed") ? 1 : ((cfg.schedulerMode == "target_fps") ? 2 : 0);
+    uint32_t llCode = (cfg.lowLatency == "boost") ? 2 : ((cfg.lowLatency == "on") ? 1 : 0);
+    uint32_t schedCode = (cfg.targetFps > 0) ? 2 : ((cfg.schedulerMode == "fixed") ? 1 : 0);
     uint32_t fallbackCode = (cfg.fallbackAction == "repeat") ? 0 : ((cfg.fallbackAction == "drop") ? 2 : 1);
     uint32_t isMenu = HotkeyManager::Get().IsMenuOpen() ? 1 : 0;
-    uint32_t isHud = cfg.showWatermark ? 1 : 0;
     uint32_t selectedItem = HotkeyManager::Get().GetSelectedItem();
 
+    uint32_t forceFallbackCode = (cfg.forceFallback == "auto") ? 0 : ((cfg.forceFallback == "repeat") ? 1 : ((cfg.forceFallback == "blend") ? 2 : 3));
+
+    uint64_t refreshNs = ExtensionManager::Get().QueryDisplayRefreshNs(data.device, data.swapchain, cfg.extDisplayTiming);
+    uint32_t dispHz = (refreshNs > 0) ? static_cast<uint32_t>(::std::round(1000000000.0 / static_cast<double>(refreshNs))) : 165u;
+
+    uint32_t confCode = 0;
+    if (cfg.confOverride >= 0.90f) confCode = 5;
+    else if (cfg.confOverride >= 0.75f) confCode = 4;
+    else if (cfg.confOverride >= 0.55f) confCode = 3;
+    else if (cfg.confOverride >= 0.35f) confCode = 2;
+    else if (cfg.confOverride >= 0.15f) confCode = 1;
+
+    uint32_t strideAndConf = (cfg.strideOverride & 0xFF) |
+                             ((confCode & 0xFF) << 8) |
+                             ((cfg.extSwapchainMaint & 0xFF) << 16);
+
     OverlayPushConstants opc{
-        w, h, isMenu, isHud, selectedItem,
-        modeCode, cfg.multiplier, profCode, searchCode,
-        schedCode, cfg.targetFps, fallbackCode, cfg.hudCorner,
+        w, h, isMenu, cfg.hudMode, selectedItem,
+        modeCode, activeMultiplier, profCode, searchCode,
+        llCode, schedCode, cfg.targetFps, fallbackCode, cfg.hudCorner,
         nativeFpsX10, honestOutputFpsX10, gpuUs, cpuUs, latUs,
-        confidenceX10, fallbackX10, liveMemoryMb
+        confidenceX10, fallbackX10, liveMemoryMb, dispHz,
+        cfg.isDebugMode ? 1u : 0u,
+        cfg.menuPage, cfg.extPresentWait, cfg.extLowLatency, cfg.extDisplayTiming, cfg.extTimestamps,
+        forceFallbackCode, cfg.debugVisual, strideAndConf
     };
 
     VkMemoryBarrier memBarrier{};
@@ -142,10 +160,6 @@ static void RecordHudOverlay(
     computeEngine.RecordOverlayPass(cmd, data.overlayDescSet, opc, w, h);
 }
 
-// -----------------------------------------------------------------------------
-// Generation Pipeline
-// -----------------------------------------------------------------------------
-
 struct SubframeTask {
     uint32_t destImageIndex;
     float t;
@@ -155,7 +169,7 @@ static void RecordFullMultiFramePipeline(
     SwapchainData& data,
     VkCommandBuffer cmd,
     uint32_t sourceGameImageIndex,
-    const std::vector<SubframeTask>& subframes,
+    const ::std::vector<SubframeTask>& subframes,
     ComputeEngine& computeEngine,
     uint32_t activeMultiplier,
     float currentFrameDeltaMs,
@@ -167,6 +181,9 @@ static void RecordFullMultiFramePipeline(
     uint32_t halfPackedW = (packedW + 1) / 2;
     uint32_t halfH = (h + 1) / 2;
 
+    uint32_t currIdx = data.frameCounter % 2;
+    uint32_t prevIdx = 1 - currIdx;
+
     VkImageCopy fullCopyRegion{};
     fullCopyRegion.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     fullCopyRegion.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -175,92 +192,123 @@ static void RecordFullMultiFramePipeline(
     const auto& cfg = SettingsManager::Get().GetSettings();
     computeEngine.BeginTimestamp(cmd);
 
-    // 1. Ingest real game frame into frameBImage
-    TransitionImage(cmd, data.realImages[sourceGameImageIndex], VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-    TransitionImage(cmd, data.frameBImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+    if (!data.historyInitialized) {
+        TransitionImage(cmd, data.realImages[sourceGameImageIndex], VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        
+        TransitionImage(cmd, data.historyFrames[prevIdx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+        vkCmdCopyImage(cmd, data.realImages[sourceGameImageIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       data.historyFrames[prevIdx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &fullCopyRegion);
+        TransitionImage(cmd, data.historyFrames[prevIdx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+        if (cfg.mode == "v2") {
+            TransitionImage(cmd, data.historyLuma[prevIdx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_WRITE_BIT);
+            computeEngine.RecordLumaPass(cmd, data.lumaDescSet[prevIdx], w, h);
+            TransitionImage(cmd, data.historyLuma[prevIdx], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+            if (cfg.profile == "quality") {
+                TransitionImage(cmd, data.historyLumaHalf[prevIdx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_WRITE_BIT);
+                computeEngine.RecordDownsamplePass(cmd, data.downsampleDescSet[prevIdx], packedW, h, halfPackedW, halfH);
+                TransitionImage(cmd, data.historyLumaHalf[prevIdx], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+            }
+        }
+        data.historyInitialized = true;
+    } else {
+        TransitionImage(cmd, data.realImages[sourceGameImageIndex], VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    }
+
+    TransitionImage(cmd, data.historyFrames[currIdx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
 
     vkCmdCopyImage(cmd, data.realImages[sourceGameImageIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                   data.frameBImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &fullCopyRegion);
+                   data.historyFrames[currIdx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &fullCopyRegion);
 
-    // 2. Optical Flow Estimation
+    TransitionImage(cmd, data.historyFrames[currIdx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
     if (cfg.mode == "v2") {
-        TransitionImage(cmd, data.frameBImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
-        TransitionImage(cmd, data.lumaBImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+        TransitionImage(cmd, data.historyLuma[currIdx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_WRITE_BIT);
-        computeEngine.RecordLumaPass(cmd, data.lumaDescSet, w, h);
+        computeEngine.RecordLumaPass(cmd, data.lumaDescSet[currIdx], w, h);
+        TransitionImage(cmd, data.historyLuma[currIdx], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+        uint32_t activeStride = (cfg.strideOverride > 0) ? cfg.strideOverride : ((cfg.searchMode == "high") ? 3 : 1);
 
         if (cfg.profile == "quality") {
-            TransitionImage(cmd, data.lumaBImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
-            TransitionImage(cmd, data.lumaBHalfImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+            TransitionImage(cmd, data.historyLumaHalf[currIdx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
                             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_WRITE_BIT);
-            computeEngine.RecordDownsamplePass(cmd, data.downsampleDescSet, packedW, h, halfPackedW, halfH);
-
-            TransitionImage(cmd, data.lumaBHalfImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            computeEngine.RecordDownsamplePass(cmd, data.downsampleDescSet[currIdx], packedW, h, halfPackedW, halfH);
+            TransitionImage(cmd, data.historyLumaHalf[currIdx], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
-            TransitionImage(cmd, data.lumaAHalfImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
             TransitionImage(cmd, data.coarseMotionImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
                             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_WRITE_BIT);
-            computeEngine.RecordFlowPass(cmd, data.coarseFlowDescSet, (w + 1) / 2, (h + 1) / 2, 2);
+            computeEngine.RecordFlowPass(cmd, data.coarseFlowDescSet[currIdx], (w + 1) / 2, (h + 1) / 2, 2);
 
             TransitionImage(cmd, data.coarseMotionImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
-            TransitionImage(cmd, data.lumaAImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
             TransitionImage(cmd, data.motionImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
                             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_WRITE_BIT);
             TransitionImage(cmd, data.confidenceImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
                             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_WRITE_BIT);
-            computeEngine.RecordRefinePass(cmd, data.refineDescSet, w, h);
+            computeEngine.RecordRefinePass(cmd, data.refineDescSet[currIdx], w, h);
         } else {
-            TransitionImage(cmd, data.lumaBImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
-            TransitionImage(cmd, data.lumaAImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
             TransitionImage(cmd, data.motionImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
                             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_WRITE_BIT);
             TransitionImage(cmd, data.confidenceImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
                             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_WRITE_BIT);
-            computeEngine.RecordFlowPass(cmd, data.directFlowDescSet, w, h, (cfg.searchMode == "high") ? 3 : 1);
+            computeEngine.RecordFlowPass(cmd, data.directFlowDescSet[currIdx], w, h, activeStride);
         }
 
         TransitionImage(cmd, data.motionImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
         TransitionImage(cmd, data.confidenceImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
-    } else {
-        TransitionImage(cmd, data.frameBImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
     }
 
-    TransitionImage(cmd, data.frameAImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    float resolvedConf = (cfg.confOverride > 0.0f) ? cfg.confOverride : ((cfg.mode == "v1") ? 2.0f : 0.55f);
+    uint32_t resolvedFallback = (cfg.fallbackAction == "repeat") ? 0 : ((cfg.fallbackAction == "drop") ? 2 : 1);
 
-    // 3. Multiplier Loop: Generates G1..Gk
+    if (cfg.forceFallback == "repeat") {
+        resolvedConf = 999.0f;
+        resolvedFallback = 0;
+    } else if (cfg.forceFallback == "blend") {
+        resolvedConf = 999.0f;
+        resolvedFallback = 1;
+    } else if (cfg.forceFallback == "drop") {
+        resolvedConf = 999.0f;
+        resolvedFallback = 2;
+    }
+
     for (size_t s = 0; s < subframes.size(); ++s) {
         TransitionImage(cmd, data.generatedImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_WRITE_BIT);
 
         WarpPushConstants pc{};
         pc.t = subframes[s].t;
-        pc.confidenceThreshold = (cfg.mode == "v1") ? 2.0f : 0.55f;
-        pc.fallbackAction = (cfg.fallbackAction == "repeat") ? 0 : ((cfg.fallbackAction == "drop") ? 2 : 1);
-        pc.showDebugWatermark = 0;
+        pc.confidenceThreshold = resolvedConf;
+        pc.fallbackAction = resolvedFallback;
+        pc.showDebugWatermark = cfg.debugVisual;
         pc.resolutionX = w;
         pc.resolutionY = h;
         pc.invResolutionX = 1.0f / static_cast<float>(w);
         pc.invResolutionY = 1.0f / static_cast<float>(h);
-        computeEngine.RecordWarpPass(cmd, data.warpDescSet, pc, w, h);
+
+        computeEngine.RecordWarpPass(cmd, data.warpDescSet[currIdx], pc, w, h);
 
         if (s == 0) {
             computeEngine.EndTimestamp(cmd);
         }
 
-        if (cfg.showWatermark || HotkeyManager::Get().IsMenuOpen()) {
+        if (cfg.hudMode != 0 || HotkeyManager::Get().IsMenuOpen() || cfg.debugVisual == 1) {
             RecordHudOverlay(data, cmd, computeEngine, activeMultiplier, currentFrameDeltaMs, honestOutputFpsX10);
         }
 
@@ -276,14 +324,13 @@ static void RecordFullMultiFramePipeline(
                         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, 0);
     }
 
-    // 4. Render live telemetry overlay on Real Frame B
-    if (cfg.showWatermark || HotkeyManager::Get().IsMenuOpen()) {
+    if (cfg.hudMode != 0 || HotkeyManager::Get().IsMenuOpen() || cfg.debugVisual == 1) {
         TransitionImage(cmd, data.generatedImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-        TransitionImage(cmd, data.frameBImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        TransitionImage(cmd, data.historyFrames[currIdx], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
 
-        vkCmdCopyImage(cmd, data.frameBImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        vkCmdCopyImage(cmd, data.historyFrames[currIdx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                        data.generatedImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &fullCopyRegion);
 
         TransitionImage(cmd, data.generatedImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
@@ -302,51 +349,13 @@ static void RecordFullMultiFramePipeline(
         TransitionImage(cmd, data.realImages[sourceGameImageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, 0);
 
-        TransitionImage(cmd, data.frameBImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        TransitionImage(cmd, data.historyFrames[currIdx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT);
     } else {
         TransitionImage(cmd, data.realImages[sourceGameImageIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, 0);
-        TransitionImage(cmd, data.frameBImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-    }
-
-    // 5. Commit Temporal History for Frame A
-    TransitionImage(cmd, data.frameAImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-    vkCmdCopyImage(cmd, data.frameBImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                   data.frameAImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &fullCopyRegion);
-
-    if (cfg.mode == "v2") {
-        VkImageCopy lumaCopyRegion{};
-        lumaCopyRegion.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        lumaCopyRegion.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        lumaCopyRegion.extent = {packedW, h, 1};
-
-        TransitionImage(cmd, data.lumaBImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-        TransitionImage(cmd, data.lumaAImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-        vkCmdCopyImage(cmd, data.lumaBImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       data.lumaAImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &lumaCopyRegion);
-
-        VkImageCopy halfLumaCopyRegion{};
-        halfLumaCopyRegion.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        halfLumaCopyRegion.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        halfLumaCopyRegion.extent = {halfPackedW, halfH, 1};
-
-        TransitionImage(cmd, data.lumaBHalfImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-        TransitionImage(cmd, data.lumaAHalfImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-        vkCmdCopyImage(cmd, data.lumaBHalfImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       data.lumaAHalfImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &halfLumaCopyRegion);
     }
 }
-
-// -----------------------------------------------------------------------------
-// Draw HUD on Real Frame B if menu/watermark is open
-// -----------------------------------------------------------------------------
 
 static void RecordRealFrameOverlayPass(
     SwapchainData& data,
@@ -387,10 +396,6 @@ static void RecordRealFrameOverlayPass(
     TransitionImage(cmd, data.realImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, 0);
 }
-
-// -----------------------------------------------------------------------------
-// Interceptor Singleton & Swapchain Init
-// -----------------------------------------------------------------------------
 
 Interceptor& Interceptor::Get() {
     static Interceptor instance;
@@ -467,17 +472,15 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
     if (workingFormat == VK_FORMAT_R8G8B8A8_SRGB) workingFormat = VK_FORMAT_R8G8B8A8_UNORM;
 
     VkImageUsageFlags sampledUsage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-    if (!allocTex(w, h, workingFormat, sampledUsage, data.frameAImage, data.frameAMemory, data.frameAView)) return false;
-    if (!allocTex(w, h, workingFormat, sampledUsage, data.frameBImage, data.frameBMemory, data.frameBView)) return false;
+
+    for (uint32_t i = 0; i < 2; ++i) {
+        if (!allocTex(w, h, workingFormat, sampledUsage, data.historyFrames[i], data.historyFrameMemory[i], data.historyFrameViews[i])) return false;
+        if (!allocTex(packedW, h, VK_FORMAT_R32_UINT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, data.historyLuma[i], data.historyLumaMemory[i], data.historyLumaViews[i])) return false;
+        if (!allocTex(halfPackedW, halfH, VK_FORMAT_R32_UINT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, data.historyLumaHalf[i], data.historyLumaHalfMemory[i], data.historyLumaHalfViews[i])) return false;
+    }
 
     VkImageUsageFlags storageUsage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (!allocTex(w, h, workingFormat, storageUsage, data.generatedImage, data.generatedMemory, data.generatedView)) return false;
-
-    if (!allocTex(packedW, h, VK_FORMAT_R32_UINT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, data.lumaAImage, data.lumaAMemory, data.lumaAView)) return false;
-    if (!allocTex(packedW, h, VK_FORMAT_R32_UINT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, data.lumaBImage, data.lumaBMemory, data.lumaBView)) return false;
-
-    if (!allocTex(halfPackedW, halfH, VK_FORMAT_R32_UINT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, data.lumaAHalfImage, data.lumaAHalfMemory, data.lumaAHalfView)) return false;
-    if (!allocTex(halfPackedW, halfH, VK_FORMAT_R32_UINT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, data.lumaBHalfImage, data.lumaBHalfMemory, data.lumaBHalfView)) return false;
 
     if (!allocTex(1, 1, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, data.dummyCoarseImage, data.dummyCoarseMemory, data.dummyCoarseView)) return false;
     if (!allocTex(halfPackedW, halfBlockGridH, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT, data.coarseMotionImage, data.coarseMotionMemory, data.coarseMotionView)) return false;
@@ -508,15 +511,15 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
     vkCreateSampler(data.device, &samplerInfo, nullptr, &data.linearSampler);
 
     std::vector<VkDescriptorPoolSize> poolSizes = {
-        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 32},
-        {VK_DESCRIPTOR_TYPE_SAMPLER, 4},
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 16}
+        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 48},
+        {VK_DESCRIPTOR_TYPE_SAMPLER, 8},
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 32}
     };
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.pNext = nullptr;
     poolInfo.flags = 0;
-    poolInfo.maxSets = 16;
+    poolInfo.maxSets = 24;
     poolInfo.poolSizeCount = (uint32_t)poolSizes.size();
     poolInfo.pPoolSizes = poolSizes.data();
     vkCreateDescriptorPool(data.device, &poolInfo, nullptr, &data.descriptorPool);
@@ -531,91 +534,95 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
         vkAllocateDescriptorSets(data.device, &allocSetInfo, &outSet);
     };
 
-    allocSet(m_computeEngine.GetLumaDescLayout(), data.lumaDescSet);
-    allocSet(m_computeEngine.GetDownsampleDescLayout(), data.downsampleDescSet);
-    allocSet(m_computeEngine.GetFlowDescLayout(), data.coarseFlowDescSet);
-    allocSet(m_computeEngine.GetRefineDescLayout(), data.refineDescSet);
-    allocSet(m_computeEngine.GetFlowDescLayout(), data.directFlowDescSet);
-    allocSet(m_computeEngine.GetWarpDescLayout(), data.warpDescSet);
+    for (uint32_t p = 0; p < 2; ++p) {
+        allocSet(m_computeEngine.GetLumaDescLayout(), data.lumaDescSet[p]);
+        allocSet(m_computeEngine.GetDownsampleDescLayout(), data.downsampleDescSet[p]);
+        allocSet(m_computeEngine.GetFlowDescLayout(), data.coarseFlowDescSet[p]);
+        allocSet(m_computeEngine.GetRefineDescLayout(), data.refineDescSet[p]);
+        allocSet(m_computeEngine.GetFlowDescLayout(), data.directFlowDescSet[p]);
+        allocSet(m_computeEngine.GetWarpDescLayout(), data.warpDescSet[p]);
+    }
     allocSet(m_computeEngine.GetOverlayDescLayout(), data.overlayDescSet);
 
-    // Descriptor Updates
-    VkDescriptorImageInfo lumaImgs[2]{
-        {VK_NULL_HANDLE, data.frameBView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-        {VK_NULL_HANDLE, data.lumaBView,  VK_IMAGE_LAYOUT_GENERAL}
-    };
-    VkWriteDescriptorSet lumaWrites[2]{};
-    lumaWrites[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, data.lumaDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &lumaImgs[0], nullptr, nullptr};
-    lumaWrites[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, data.lumaDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &lumaImgs[1], nullptr, nullptr};
-    vkUpdateDescriptorSets(data.device, 2, lumaWrites, 0, nullptr);
+    for (uint32_t curr = 0; curr < 2; ++curr) {
+        uint32_t prev = 1 - curr;
 
-    VkDescriptorImageInfo downImgs[2]{
-        {VK_NULL_HANDLE, data.lumaBView,     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-        {VK_NULL_HANDLE, data.lumaBHalfView, VK_IMAGE_LAYOUT_GENERAL}
-    };
-    VkWriteDescriptorSet downWrites[2]{};
-    downWrites[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, data.downsampleDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &downImgs[0], nullptr, nullptr};
-    downWrites[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, data.downsampleDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &downImgs[1], nullptr, nullptr};
-    vkUpdateDescriptorSets(data.device, 2, downWrites, 0, nullptr);
+        VkDescriptorImageInfo lumaImgs[2]{
+            {VK_NULL_HANDLE, data.historyFrameViews[curr], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+            {VK_NULL_HANDLE, data.historyLumaViews[curr],  VK_IMAGE_LAYOUT_GENERAL}
+        };
+        VkWriteDescriptorSet lumaWrites[2]{};
+        lumaWrites[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, data.lumaDescSet[curr], 0, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &lumaImgs[0], nullptr, nullptr};
+        lumaWrites[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, data.lumaDescSet[curr], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &lumaImgs[1], nullptr, nullptr};
+        vkUpdateDescriptorSets(data.device, 2, lumaWrites, 0, nullptr);
 
-    VkDescriptorImageInfo coarseImgs[5]{
-        {VK_NULL_HANDLE, data.lumaAHalfView,     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-        {VK_NULL_HANDLE, data.lumaBHalfView,     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-        {VK_NULL_HANDLE, data.dummyCoarseView,   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-        {VK_NULL_HANDLE, data.coarseMotionView,  VK_IMAGE_LAYOUT_GENERAL},
-        {VK_NULL_HANDLE, data.confidenceView,    VK_IMAGE_LAYOUT_GENERAL}
-    };
-    VkWriteDescriptorSet coarseWrites[5]{};
-    for (uint32_t i = 0; i < 5; ++i) {
-        coarseWrites[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, data.coarseFlowDescSet, i, 0, 1, (i >= 3) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &coarseImgs[i], nullptr, nullptr};
+        VkDescriptorImageInfo downImgs[2]{
+            {VK_NULL_HANDLE, data.historyLumaViews[curr],     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+            {VK_NULL_HANDLE, data.historyLumaHalfViews[curr], VK_IMAGE_LAYOUT_GENERAL}
+        };
+        VkWriteDescriptorSet downWrites[2]{};
+        downWrites[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, data.downsampleDescSet[curr], 0, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &downImgs[0], nullptr, nullptr};
+        downWrites[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, data.downsampleDescSet[curr], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &downImgs[1], nullptr, nullptr};
+        vkUpdateDescriptorSets(data.device, 2, downWrites, 0, nullptr);
+
+        VkDescriptorImageInfo coarseImgs[5]{
+            {VK_NULL_HANDLE, data.historyLumaHalfViews[prev], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+            {VK_NULL_HANDLE, data.historyLumaHalfViews[curr], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+            {VK_NULL_HANDLE, data.dummyCoarseView,           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+            {VK_NULL_HANDLE, data.coarseMotionView,          VK_IMAGE_LAYOUT_GENERAL},
+            {VK_NULL_HANDLE, data.confidenceView,            VK_IMAGE_LAYOUT_GENERAL}
+        };
+        VkWriteDescriptorSet coarseWrites[5]{};
+        for (uint32_t i = 0; i < 5; ++i) {
+            coarseWrites[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, data.coarseFlowDescSet[curr], i, 0, 1, (i >= 3) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &coarseImgs[i], nullptr, nullptr};
+        }
+        vkUpdateDescriptorSets(data.device, 5, coarseWrites, 0, nullptr);
+
+        VkDescriptorImageInfo refineImgs[5]{
+            {VK_NULL_HANDLE, data.historyLumaViews[prev], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+            {VK_NULL_HANDLE, data.historyLumaViews[curr], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+            {VK_NULL_HANDLE, data.coarseMotionView,       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+            {VK_NULL_HANDLE, data.motionView,             VK_IMAGE_LAYOUT_GENERAL},
+            {VK_NULL_HANDLE, data.confidenceView,         VK_IMAGE_LAYOUT_GENERAL}
+        };
+        VkWriteDescriptorSet refineWrites[5]{};
+        for (uint32_t i = 0; i < 5; ++i) {
+            refineWrites[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, data.refineDescSet[curr], i, 0, 1, (i >= 3) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &refineImgs[i], nullptr, nullptr};
+        }
+        vkUpdateDescriptorSets(data.device, 5, refineWrites, 0, nullptr);
+
+        VkDescriptorImageInfo directImgs[5]{
+            {VK_NULL_HANDLE, data.historyLumaViews[prev], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+            {VK_NULL_HANDLE, data.historyLumaViews[curr], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+            {VK_NULL_HANDLE, data.dummyCoarseView,       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+            {VK_NULL_HANDLE, data.motionView,             VK_IMAGE_LAYOUT_GENERAL},
+            {VK_NULL_HANDLE, data.confidenceView,         VK_IMAGE_LAYOUT_GENERAL}
+        };
+        VkWriteDescriptorSet directWrites[5]{};
+        for (uint32_t i = 0; i < 5; ++i) {
+            directWrites[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, data.directFlowDescSet[curr], i, 0, 1, (i >= 3) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &directImgs[i], nullptr, nullptr};
+        }
+        vkUpdateDescriptorSets(data.device, 5, directWrites, 0, nullptr);
+
+        VkDescriptorImageInfo warpImgs[6]{
+            {VK_NULL_HANDLE, data.historyFrameViews[prev], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+            {VK_NULL_HANDLE, data.historyFrameViews[curr], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+            {VK_NULL_HANDLE, data.motionView,             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+            {VK_NULL_HANDLE, data.confidenceView,         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+            {data.linearSampler, VK_NULL_HANDLE,          VK_IMAGE_LAYOUT_UNDEFINED},
+            {VK_NULL_HANDLE, data.generatedView,          VK_IMAGE_LAYOUT_GENERAL}
+        };
+        VkWriteDescriptorSet warpWrites[6]{};
+        for (uint32_t i = 0; i < 6; ++i) {
+            warpWrites[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, data.warpDescSet[curr], i, 0, 1, (i == 4) ? VK_DESCRIPTOR_TYPE_SAMPLER : ((i == 5) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE), &warpImgs[i], nullptr, nullptr};
+        }
+        vkUpdateDescriptorSets(data.device, 6, warpWrites, 0, nullptr);
     }
-    vkUpdateDescriptorSets(data.device, 5, coarseWrites, 0, nullptr);
-
-    VkDescriptorImageInfo refineImgs[5]{
-        {VK_NULL_HANDLE, data.lumaAView,         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-        {VK_NULL_HANDLE, data.lumaBView,         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-        {VK_NULL_HANDLE, data.coarseMotionView,  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-        {VK_NULL_HANDLE, data.motionView,        VK_IMAGE_LAYOUT_GENERAL},
-        {VK_NULL_HANDLE, data.confidenceView,    VK_IMAGE_LAYOUT_GENERAL}
-    };
-    VkWriteDescriptorSet refineWrites[5]{};
-    for (uint32_t i = 0; i < 5; ++i) {
-        refineWrites[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, data.refineDescSet, i, 0, 1, (i >= 3) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &refineImgs[i], nullptr, nullptr};
-    }
-    vkUpdateDescriptorSets(data.device, 5, refineWrites, 0, nullptr);
-
-    VkDescriptorImageInfo directImgs[5]{
-        {VK_NULL_HANDLE, data.lumaAView,         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-        {VK_NULL_HANDLE, data.lumaBView,         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-        {VK_NULL_HANDLE, data.dummyCoarseView,   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-        {VK_NULL_HANDLE, data.motionView,        VK_IMAGE_LAYOUT_GENERAL},
-        {VK_NULL_HANDLE, data.confidenceView,    VK_IMAGE_LAYOUT_GENERAL}
-    };
-    VkWriteDescriptorSet directWrites[5]{};
-    for (uint32_t i = 0; i < 5; ++i) {
-        directWrites[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, data.directFlowDescSet, i, 0, 1, (i >= 3) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &directImgs[i], nullptr, nullptr};
-    }
-    vkUpdateDescriptorSets(data.device, 5, directWrites, 0, nullptr);
-
-    VkDescriptorImageInfo warpImgs[6]{
-        {VK_NULL_HANDLE, data.frameAView,     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-        {VK_NULL_HANDLE, data.frameBView,     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-        {VK_NULL_HANDLE, data.motionView,     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-        {VK_NULL_HANDLE, data.confidenceView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-        {data.linearSampler, VK_NULL_HANDLE,  VK_IMAGE_LAYOUT_UNDEFINED},
-        {VK_NULL_HANDLE, data.generatedView,  VK_IMAGE_LAYOUT_GENERAL}
-    };
-    VkWriteDescriptorSet warpWrites[6]{};
-    for (uint32_t i = 0; i < 6; ++i) {
-        warpWrites[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, data.warpDescSet, i, 0, 1, (i == 4) ? VK_DESCRIPTOR_TYPE_SAMPLER : ((i == 5) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE), &warpImgs[i], nullptr, nullptr};
-    }
-    vkUpdateDescriptorSets(data.device, 6, warpWrites, 0, nullptr);
 
     VkDescriptorImageInfo overlayImg{VK_NULL_HANDLE, data.generatedView, VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet overlayWrite{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, data.overlayDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &overlayImg, nullptr, nullptr};
     vkUpdateDescriptorSets(data.device, 1, &overlayWrite, 0, nullptr);
 
-    // Command Buffers and Synchronization Fences
     VkCommandBufferAllocateInfo cmdAllocInfo{};
     cmdAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     cmdAllocInfo.pNext = nullptr;
@@ -645,10 +652,10 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
 
         vkCreateFence(data.device, &fenceInfo, nullptr, &data.frameSlots[slot].frameFence);
         vkCreateSemaphore(data.device, &semInfo, nullptr, &data.frameSlots[slot].realDoneSemaphore);
-        data.frameSlots[slot].isFenceSignaled = true;
     }
 
     data.buffersAllocated = true;
+    data.historyInitialized = false;
     return true;
 }
 
@@ -673,12 +680,12 @@ void Interceptor::CleanupSwapchainData(SwapchainData& data) {
         if (mem != VK_NULL_HANDLE) vkFreeMemory(data.device, mem, nullptr);
     };
 
-    destroyTex(data.frameAImage, data.frameAMemory, data.frameAView);
-    destroyTex(data.frameBImage, data.frameBMemory, data.frameBView);
-    destroyTex(data.lumaAImage, data.lumaAMemory, data.lumaAView);
-    destroyTex(data.lumaBImage, data.lumaBMemory, data.lumaBView);
-    destroyTex(data.lumaAHalfImage, data.lumaAHalfMemory, data.lumaAHalfView);
-    destroyTex(data.lumaBHalfImage, data.lumaBHalfMemory, data.lumaBHalfView);
+    for (uint32_t i = 0; i < 2; ++i) {
+        destroyTex(data.historyFrames[i], data.historyFrameMemory[i], data.historyFrameViews[i]);
+        destroyTex(data.historyLuma[i], data.historyLumaMemory[i], data.historyLumaViews[i]);
+        destroyTex(data.historyLumaHalf[i], data.historyLumaHalfMemory[i], data.historyLumaHalfViews[i]);
+    }
+
     destroyTex(data.dummyCoarseImage, data.dummyCoarseMemory, data.dummyCoarseView);
     destroyTex(data.coarseMotionImage, data.coarseMotionMemory, data.coarseMotionView);
     destroyTex(data.motionImage, data.motionMemory, data.motionView);
@@ -697,13 +704,15 @@ VkResult Interceptor::OnCreateSwapchainKHR(
 ) {
     SettingsManager::Get().LoadOrCreate();
 
-    // Progressive buffer probe
-    uint32_t candidateCounts[] = { 8u, 7u, 6u, 5u };
+    // -------------------------------------------------------------------------
+    // ЗАПРАШИВАЕМ ПУЛ ИЗ 8 ОБРАЗОВ ДЛЯ РАБОТЫ 4x, 5x, 6x С БЕЗОПАСНЫМ СПУСКОМ
+    // -------------------------------------------------------------------------
+    uint32_t candidateCounts[] = { 8u, 7u, 6u, 5u, 4u };
     VkResult result = VK_ERROR_INITIALIZATION_FAILED;
 
     for (uint32_t count : candidateCounts) {
         VkSwapchainCreateInfoKHR modifiedCreateInfo = *pCreateInfo;
-        modifiedCreateInfo.minImageCount = std::max(pCreateInfo->minImageCount + 4u, count);
+        modifiedCreateInfo.minImageCount = std::max(pCreateInfo->minImageCount + 3u, count);
         modifiedCreateInfo.imageUsage |= (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
 
         result = realFunc(device, &modifiedCreateInfo, pAllocator, pSwapchain);
@@ -711,12 +720,14 @@ VkResult Interceptor::OnCreateSwapchainKHR(
     }
 
     if (result != VK_SUCCESS) {
-        result = realFunc(device, pCreateInfo, pAllocator, pSwapchain);
+        VkSwapchainCreateInfoKHR fallbackInfo = *pCreateInfo;
+        fallbackInfo.imageUsage |= (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+        result = realFunc(device, &fallbackInfo, pAllocator, pSwapchain);
         if (result != VK_SUCCESS) return result;
     }
 
     if (!m_computeEngineInitialized) {
-        m_computeEngine.Initialize(device, m_cachedPhysicalDevice);
+        m_computeEngine.Initialize(device, m_cachedTimestampPeriod);
         m_computeEngineInitialized = true;
     }
 
@@ -762,10 +773,6 @@ void Interceptor::OnDestroySwapchainKHR(
     realFunc(device, swapchain, pAllocator);
 }
 
-// -----------------------------------------------------------------------------
-// Present Hook: Rock-Solid Fractional Telemetry Engine
-// -----------------------------------------------------------------------------
-
 VkResult Interceptor::OnQueuePresentKHR(
     VkQueue queue,
     const VkPresentInfoKHR* pPresentInfo,
@@ -785,113 +792,17 @@ VkResult Interceptor::OnQueuePresentKHR(
             if (!data.buffersAllocated) return realFunc(queue, pPresentInfo);
 
             const auto& cfg = SettingsManager::Get().GetSettings();
-            if (cfg.mode == "off") return realFunc(queue, pPresentInfo);
 
-            // =========================================================================
-            // 1. EXACT NATIVE FPS MEASUREMENT
-            // =========================================================================
-            auto now = std::chrono::high_resolution_clock::now();
-            float trueFrameDeltaMs = std::chrono::duration<float, std::milli>(now - data.lastPresentTime).count();
-            data.lastPresentTime = now;
+            if (cfg.mode == "off") {
+                if (cfg.hudMode != 0 || HotkeyManager::Get().IsMenuOpen()) {
+                    uint32_t honestOutputFpsX10 = static_cast<uint32_t>((1000.0f / std::max(1.0f, data.smoothedFrametimeMs)) * 10.0f);
+                    
+                    uint32_t slot = data.currentFlightSlot;
+                    FrameFlightResources& res = data.frameSlots[slot];
 
-            if (trueFrameDeltaMs >= 1.0f && trueFrameDeltaMs <= 200.0f) {
-                constexpr float alpha = 0.15f;
-                data.smoothedFrametimeMs = alpha * trueFrameDeltaMs + (1.0f - alpha) * data.smoothedFrametimeMs;
-            }
-
-            data.frameCounter++;
-            if (data.frameCounter <= 2) {
-                return realFunc(queue, pPresentInfo);
-            }
-
-            uint32_t slot = data.currentFlightSlot;
-            FrameFlightResources& res = data.frameSlots[slot];
-
-            if (!res.isFenceSignaled) {
-                VkResult fenceRes = vkWaitForFences(data.device, 1, &res.frameFence, VK_TRUE, UINT64_MAX);
-                if (fenceRes == VK_SUCCESS) {
+                    vkWaitForFences(data.device, 1, &res.frameFence, VK_TRUE, UINT64_MAX);
                     vkResetFences(data.device, 1, &res.frameFence);
-                    res.isFenceSignaled = true;
-                }
-            }
 
-            // =========================================================================
-            // 2. Multiplier & Target FPS Logic
-            // =========================================================================
-            float nativeFps = 1000.0f / std::max(1.0f, data.smoothedFrametimeMs);
-            bool isTargetFpsMode = (cfg.schedulerMode == "target_fps" && cfg.targetFps > 0);
-            uint32_t subframesToGenerate = 0;
-
-            if (isTargetFpsMode) {
-                float targetFpsF = static_cast<float>(cfg.targetFps);
-
-                if (nativeFps >= (targetFpsF * 0.98f)) {
-                    data.fractionalDebt = 0.0f;
-                    subframesToGenerate = 0;
-                } else {
-                    float targetRatio = targetFpsF / nativeFps;
-                    float extraNeeded = targetRatio - 1.0f;
-                    data.fractionalDebt += extraNeeded;
-
-                    subframesToGenerate = static_cast<uint32_t>(data.fractionalDebt);
-                    uint32_t maxAllowed = std::min(5u, (uint32_t)MAX_MULTIPLIER_FRAMES - 1);
-                    subframesToGenerate = std::min(subframesToGenerate, maxAllowed);
-                }
-            } else {
-                uint32_t activeMultiplier = std::clamp(cfg.multiplier, 2u, 6u);
-                subframesToGenerate = activeMultiplier - 1;
-            }
-
-            // =========================================================================
-            // 3. Acquire Subframe Buffers
-            // =========================================================================
-            std::vector<SubframeTask> tasks;
-            if (subframesToGenerate > 0) {
-                for (uint32_t m = 0; m < subframesToGenerate; ++m) {
-                    uint32_t genImg = 0;
-                    VkResult acq = vkAcquireNextImageKHR(
-                        data.device, data.swapchain, 2000000ULL,
-                        res.acquireSemaphores[m], VK_NULL_HANDLE, &genImg
-                    );
-
-                    if (acq == VK_SUCCESS || acq == VK_SUBOPTIMAL_KHR) {
-                        tasks.push_back({genImg, 0.0f});
-                    } else {
-                        break;
-                    }
-                }
-            }
-
-            if (isTargetFpsMode) {
-                data.fractionalDebt -= static_cast<float>(tasks.size());
-                data.fractionalDebt = std::max(0.0f, data.fractionalDebt);
-            }
-
-            // =========================================================================
-            // 4. SMOOTHED FRACTIONAL TELEMETRY (Prevents 75/90 FPS HUD Glitches)
-            // =========================================================================
-            float currentOutputCount = static_cast<float>(tasks.size() + 1);
-            float currentInstantFps = nativeFps * currentOutputCount;
-
-            // Exponential moving average over fractional cadences (e.g. 1.25x or 1.5x)
-            constexpr float outAlpha = 0.10f;
-            data.smoothedOutputFps = outAlpha * currentInstantFps + (1.0f - outAlpha) * data.smoothedOutputFps;
-
-            // Anchor around Target FPS if within tolerance to give a rock-solid display
-            float displayOutputFps = data.smoothedOutputFps;
-            if (isTargetFpsMode) {
-                float targetFpsF = static_cast<float>(cfg.targetFps);
-                if (std::abs(displayOutputFps - targetFpsF) < (targetFpsF * 0.06f)) {
-                    displayOutputFps = targetFpsF;
-                }
-            }
-            uint32_t honestOutputFpsX10 = static_cast<uint32_t>(displayOutputFps * 10.0f);
-
-            // =========================================================================
-            // Fallback for 0 subframes: Render HUD on native frame without blinking
-            // =========================================================================
-            if (tasks.empty()) {
-                if (cfg.showWatermark || HotkeyManager::Get().IsMenuOpen()) {
                     VkCommandBuffer realCmd = res.realCommandBuffer;
                     vkResetCommandBuffer(realCmd, 0);
                     VkCommandBufferBeginInfo bInfo{};
@@ -924,12 +835,167 @@ VkResult Interceptor::OnQueuePresentKHR(
                     realSubmit.signalSemaphoreCount = 1;
                     realSubmit.pSignalSemaphores = &res.realDoneSemaphore;
 
-                    res.isFenceSignaled = false;
                     vkQueueSubmit(queue, 1, &realSubmit, res.frameFence);
 
                     VkPresentInfoKHR presentReal = *pPresentInfo;
                     presentReal.waitSemaphoreCount = 1;
                     presentReal.pWaitSemaphores = &res.realDoneSemaphore;
+
+                    data.currentFlightSlot = (data.currentFlightSlot + 1) % MAX_FRAMES_IN_FLIGHT;
+                    return realFunc(queue, &presentReal);
+                }
+                return realFunc(queue, pPresentInfo);
+            }
+
+            data.frameCounter++;
+
+            // 1. БЕЗОПАСНЫЙ PRESENT WAIT: вызывается ТОЛЬКО если юзер явно включил режим 1 или 2
+            // По умолчанию (0=Auto или 3=Disabled) вызов блокирующего ожидания ЗАПРЕЩЕН
+            if ((cfg.extPresentWait == 1 || cfg.extPresentWait == 2) && data.frameCounter > 10) {
+                ExtensionManager::Get().WaitForPresentQueue(data.device, data.swapchain, data.frameCounter - 1, cfg.extPresentWait);
+            }
+
+            // 2. Неблокирующие маркеры Low Latency
+            if (cfg.lowLatency != "off") {
+                ExtensionManager::Get().MarkAntiLagStage(data.device, VK_ANTI_LAG_STAGE_PRESENT_AMD, data.frameCounter, cfg.extLowLatency);
+                ExtensionManager::Get().MarkReflexMarker(data.device, data.swapchain, VK_LATENCY_MARKER_PRESENT_START_NV, data.frameCounter, cfg.extLowLatency);
+            }
+
+            auto now = std::chrono::high_resolution_clock::now();
+            float trueFrameDeltaMs = std::chrono::duration<float, std::milli>(now - data.lastPresentTime).count();
+            data.lastPresentTime = now;
+
+            if (trueFrameDeltaMs >= 1.0f && trueFrameDeltaMs <= 200.0f) {
+                constexpr float alpha = 0.15f;
+                data.smoothedFrametimeMs = alpha * trueFrameDeltaMs + (1.0f - alpha) * data.smoothedFrametimeMs;
+            }
+
+            if (data.frameCounter <= 2) {
+                data.lastPresentExitTime = std::chrono::high_resolution_clock::now();
+                return realFunc(queue, pPresentInfo);
+            }
+
+            uint32_t slot = data.currentFlightSlot;
+            FrameFlightResources& res = data.frameSlots[slot];
+
+            float nativeFps = 1000.0f / std::max(1.0f, data.smoothedFrametimeMs);
+
+            // -----------------------------------------------------------------
+            // ЧЕСТНЫЙ И НЕЗАВИСИМЫЙ TARGET FPS
+            // -----------------------------------------------------------------
+            bool isTargetFpsMode = (cfg.targetFps > 0 && cfg.schedulerMode != "fixed");
+            uint32_t subframesToGenerate = 0;
+
+            if (isTargetFpsMode) {
+                float targetFpsF = static_cast<float>(cfg.targetFps);
+                if (nativeFps >= (targetFpsF * 0.98f)) {
+                    // Игра уже выдает нужный FPS: сабкадры не нужны
+                    data.fractionalDebt = 0.0f;
+                    subframesToGenerate = 0;
+                } else {
+                    float targetRatio = targetFpsF / nativeFps;
+                    float extraNeeded = targetRatio - 1.0f;
+                    data.fractionalDebt += extraNeeded;
+
+                    uint32_t requested = static_cast<uint32_t>(data.fractionalDebt);
+                    // Разрешаем до 5 сабкадров (до 6x)
+                    subframesToGenerate = std::min(requested, 5u);
+                }
+            } else {
+                // Если Target FPS выключен, работает строго множитель
+                uint32_t activeMultiplier = std::clamp(cfg.multiplier, 2u, 6u);
+                subframesToGenerate = activeMultiplier - 1;
+            }
+
+            uint32_t realGameImageIndex = pPresentInfo->pImageIndices[i];
+
+            // -----------------------------------------------------------------
+            // ЗАХВАТ САБКАДРОВ С ЗАЩИТОЙ ОТ ДВОЙНОГО ЗАХВАТА И СТОПОРА
+            // -----------------------------------------------------------------
+            std::vector<SubframeTask> tasks;
+            if (subframesToGenerate > 0) {
+                for (uint32_t m = 0; m < subframesToGenerate; ++m) {
+                    uint32_t genImg = 0;
+                    VkResult acq = vkAcquireNextImageKHR(
+                        data.device, data.swapchain, 0ULL,
+                        res.acquireSemaphores[m], VK_NULL_HANDLE, &genImg
+                    );
+
+                    if (acq == VK_SUCCESS || acq == VK_SUBOPTIMAL_KHR) {
+                        // Защита: нельзя писать в тот же образ, который игра сейчас показывает!
+                        if (genImg != realGameImageIndex) {
+                            tasks.push_back({genImg, 0.0f});
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            if (isTargetFpsMode) {
+                data.fractionalDebt -= static_cast<float>(tasks.size());
+                data.fractionalDebt = std::clamp(data.fractionalDebt, 0.0f, 2.0f);
+            }
+
+            float currentOutputCount = static_cast<float>(tasks.size() + 1);
+            float currentInstantFps = nativeFps * currentOutputCount;
+
+            constexpr float outAlpha = 0.10f;
+            data.smoothedOutputFps = outAlpha * currentInstantFps + (1.0f - outAlpha) * data.smoothedOutputFps;
+
+            float displayOutputFps = data.smoothedOutputFps;
+            if (isTargetFpsMode) {
+                float targetFpsF = static_cast<float>(cfg.targetFps);
+                if (std::abs(displayOutputFps - targetFpsF) < (targetFpsF * 0.06f)) {
+                    displayOutputFps = targetFpsF;
+                }
+            }
+            uint32_t honestOutputFpsX10 = static_cast<uint32_t>(displayOutputFps * 10.0f);
+
+            if (tasks.empty()) {
+                if (cfg.hudMode != 0 || HotkeyManager::Get().IsMenuOpen() || cfg.debugVisual == 1) {
+                    vkWaitForFences(data.device, 1, &res.frameFence, VK_TRUE, UINT64_MAX);
+                    vkResetFences(data.device, 1, &res.frameFence);
+
+                    VkCommandBuffer realCmd = res.realCommandBuffer;
+                    vkResetCommandBuffer(realCmd, 0);
+                    VkCommandBufferBeginInfo bInfo{};
+                    bInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+                    bInfo.pNext = nullptr;
+                    bInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                    vkBeginCommandBuffer(realCmd, &bInfo);
+
+                    RecordRealFrameOverlayPass(data, realCmd, pPresentInfo->pImageIndices[i], m_computeEngine, honestOutputFpsX10);
+
+                    vkEndCommandBuffer(realCmd);
+
+                    std::vector<VkSemaphore> waitSems;
+                    std::vector<VkPipelineStageFlags> waitStages;
+                    if (pPresentInfo->waitSemaphoreCount > 0 && pPresentInfo->pWaitSemaphores) {
+                        for (uint32_t s = 0; s < pPresentInfo->waitSemaphoreCount; ++s) {
+                            waitSems.push_back(pPresentInfo->pWaitSemaphores[s]);
+                            waitStages.push_back(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+                        }
+                    }
+
+                    VkSubmitInfo realSubmit{};
+                    realSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+                    realSubmit.pNext = nullptr;
+                    realSubmit.waitSemaphoreCount = static_cast<uint32_t>(waitSems.size());
+                    realSubmit.pWaitSemaphores = waitSems.data();
+                    realSubmit.pWaitDstStageMask = waitStages.data();
+                    realSubmit.commandBufferCount = 1;
+                    realSubmit.pCommandBuffers = &realCmd;
+                    realSubmit.signalSemaphoreCount = 1;
+                    realSubmit.pSignalSemaphores = &res.realDoneSemaphore;
+
+                    vkQueueSubmit(queue, 1, &realSubmit, res.frameFence);
+
+                    VkPresentInfoKHR presentReal = *pPresentInfo;
+                    presentReal.waitSemaphoreCount = 1;
+                    presentReal.pWaitSemaphores = &res.realDoneSemaphore;
+
+                    data.currentFlightSlot = (data.currentFlightSlot + 1) % MAX_FRAMES_IN_FLIGHT;
                     return realFunc(queue, &presentReal);
                 }
                 return realFunc(queue, pPresentInfo);
@@ -940,11 +1006,9 @@ VkResult Interceptor::OnQueuePresentKHR(
                 tasks[k].t = stepT * static_cast<float>(k + 1);
             }
 
-            uint32_t realGameImageIndex = pPresentInfo->pImageIndices[i];
+            vkWaitForFences(data.device, 1, &res.frameFence, VK_TRUE, UINT64_MAX);
+            vkResetFences(data.device, 1, &res.frameFence);
 
-            // =========================================================================
-            // 5. Record All Subframes + Real Frame
-            // =========================================================================
             VkCommandBuffer genCmd = res.genCommandBuffers[0];
             vkResetCommandBuffer(genCmd, 0);
 
@@ -954,7 +1018,8 @@ VkResult Interceptor::OnQueuePresentKHR(
             beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             vkBeginCommandBuffer(genCmd, &beginInfo);
 
-            RecordFullMultiFramePipeline(data, genCmd, realGameImageIndex, tasks, m_computeEngine, (uint32_t)(tasks.size() + 1), trueFrameDeltaMs, honestOutputFpsX10);
+            uint32_t totalFramesDisplayed = static_cast<uint32_t>(tasks.size() + 1);
+            RecordFullMultiFramePipeline(data, genCmd, realGameImageIndex, tasks, m_computeEngine, totalFramesDisplayed, trueFrameDeltaMs, honestOutputFpsX10);
 
             vkEndCommandBuffer(genCmd);
 
@@ -978,9 +1043,17 @@ VkResult Interceptor::OnQueuePresentKHR(
             }
             signalSems.push_back(res.realDoneSemaphore);
 
+            VkFrameBoundaryEXT frameBoundary{};
+            frameBoundary.sType = VK_STRUCTURE_TYPE_FRAME_BOUNDARY_EXT;
+            frameBoundary.pNext = nullptr;
+            frameBoundary.flags = VK_FRAME_BOUNDARY_FRAME_END_BIT_EXT;
+            frameBoundary.frameID = data.frameCounter;
+            frameBoundary.imageCount = 1;
+            frameBoundary.pImages = &data.realImages[realGameImageIndex];
+
             VkSubmitInfo genSubmit{};
             genSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-            genSubmit.pNext = nullptr;
+            genSubmit.pNext = ExtensionManager::Get().GetSupported().hasFrameBoundary ? &frameBoundary : nullptr;
             genSubmit.waitSemaphoreCount = static_cast<uint32_t>(waitSems.size());
             genSubmit.pWaitSemaphores = waitSems.data();
             genSubmit.pWaitDstStageMask = waitStages.data();
@@ -989,12 +1062,8 @@ VkResult Interceptor::OnQueuePresentKHR(
             genSubmit.signalSemaphoreCount = static_cast<uint32_t>(signalSems.size());
             genSubmit.pSignalSemaphores = signalSems.data();
 
-            res.isFenceSignaled = false;
             vkQueueSubmit(queue, 1, &genSubmit, res.frameFence);
 
-            // =========================================================================
-            // 6. Present Generated Subframes + Real Frame
-            // =========================================================================
             for (size_t k = 0; k < tasks.size(); ++k) {
                 VkPresentInfoKHR presentG{};
                 presentG.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
@@ -1005,6 +1074,7 @@ VkResult Interceptor::OnQueuePresentKHR(
                 presentG.pSwapchains = &data.swapchain;
                 presentG.pImageIndices = &tasks[k].destImageIndex;
                 presentG.pResults = nullptr;
+
                 realFunc(queue, &presentG);
             }
 
@@ -1013,9 +1083,14 @@ VkResult Interceptor::OnQueuePresentKHR(
             presentReal.pWaitSemaphores = &res.realDoneSemaphore;
             realFunc(queue, &presentReal);
 
+            if (cfg.lowLatency != "off") {
+                ExtensionManager::Get().MarkReflexMarker(data.device, data.swapchain, VK_LATENCY_MARKER_PRESENT_END_NV, data.frameCounter, cfg.extLowLatency);
+            }
+
             auto cpuEndTime = std::chrono::high_resolution_clock::now();
             data.lastCpuTimeMs = std::chrono::duration<float, std::milli>(cpuEndTime - cpuStartTime).count();
 
+            data.lastPresentExitTime = std::chrono::high_resolution_clock::now();
             data.currentFlightSlot = (data.currentFlightSlot + 1) % MAX_FRAMES_IN_FLIGHT;
             return VK_SUCCESS;
         }

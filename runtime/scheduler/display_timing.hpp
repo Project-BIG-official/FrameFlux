@@ -5,6 +5,7 @@
 
 #include <vulkan/vulkan.h>
 #include <cstdint>
+#include <chrono>
 
 namespace FrameFlux {
 
@@ -16,7 +17,8 @@ public:
 
 private:
     DisplayTiming() = default;
-    uint32_t m_cachedHz = 60;
+    uint32_t m_cachedHz = 165;
+    std::chrono::steady_clock::time_point m_lastQueryTime{};
 };
 
 } // namespace FrameFlux

@@ -51,6 +51,7 @@ uint computeBlockSSD_DP4A(uint packedA, uint packedB) {
 
 [shader("compute")]
 [numthreads(32, 1, 1)]
+[WaveSize(32)]
 void computeMain(uint3 groupID : SV_GroupID, uint laneIndex : SV_GroupIndex) {
     uint2 blockCoord = groupID.xy;
     if (blockCoord.x >= pc.blockGridDim.x || blockCoord.y >= pc.blockGridDim.y) return;

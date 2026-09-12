@@ -1,5 +1,5 @@
 // PB FrameFlux - LGPL-2.1
-// layer/compute_engine.cpp: 2-Pass Refinement & True GPU Timers
+// layer/compute_engine.cpp: Subgroup Wave32 Control & Calibrated Timers
 
 #include "compute_engine.hpp"
 
@@ -33,20 +33,12 @@ ComputeEngine::~ComputeEngine() {
     Cleanup();
 }
 
-void ComputeEngine::InitQueryPool(VkPhysicalDevice physicalDevice) {
-    VkPhysicalDeviceProperties props;
-    if (physicalDevice != VK_NULL_HANDLE) {
-        vkGetPhysicalDeviceProperties(physicalDevice, &props);
-        m_timestampPeriod = props.limits.timestampPeriod; // in nanoseconds
-    }
+bool ComputeEngine::Initialize(VkDevice device, float timestampPeriod) {
+    m_device = device;
+    m_timestampPeriod = (timestampPeriod > 0.0f) ? timestampPeriod : 1.0f;
 
     VkQueryPoolCreateInfo qpInfo{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, nullptr, 0, VK_QUERY_TYPE_TIMESTAMP, 2, 0};
     vkCreateQueryPool(m_device, &qpInfo, nullptr, &m_queryPool);
-}
-
-bool ComputeEngine::Initialize(VkDevice device, VkPhysicalDevice physicalDevice) {
-    m_device = device;
-    InitQueryPool(physicalDevice);
 
     return CreateLumaPipeline() && 
            CreateDownsamplePipeline() && 
@@ -102,6 +94,7 @@ void ComputeEngine::Cleanup() {
     destroyPipe(m_flowPipeline, m_flowPipeLayout, m_flowDescLayout, m_flowShader);
     destroyPipe(m_refinePipeline, m_refinePipeLayout, m_refineDescLayout, m_refineShader);
     destroyPipe(m_warpPipeline, m_warpPipeLayout, m_warpDescLayout, m_warpShader);
+    destroyPipe(m_overlayPipeline, m_overlayPipeLayout, m_overlayDescLayout, m_overlayShader);
 }
 
 bool ComputeEngine::CreateLumaPipeline() {
@@ -164,19 +157,27 @@ bool ComputeEngine::CreateFlowPipeline() {
 
     VkPipelineShaderStageCreateInfo stageInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m_flowShader, "main", nullptr};
 
-    #ifdef VK_EXT_subgroup_size_control
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT sizeControl{};
     sizeControl.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT;
+    sizeControl.pNext = nullptr;
     sizeControl.requiredSubgroupSize = 32;
 
     if (ExtensionManager::Get().GetSupported().hasSubgroupSizeControl) {
         stageInfo.pNext = &sizeControl;
         stageInfo.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
     }
-    #endif
 
     VkComputePipelineCreateInfo pipeInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, nullptr, 0, stageInfo, m_flowPipeLayout, VK_NULL_HANDLE, -1};
-    return vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_flowPipeline) == VK_SUCCESS;
+    VkResult res = vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_flowPipeline);
+    
+    // Безопасный Fallback: если драйвер отверг Subgroup Size Control, создаем обычный пайплайн
+    if (res != VK_SUCCESS) {
+        stageInfo.pNext = nullptr;
+        stageInfo.flags = 0;
+        pipeInfo.stage = stageInfo;
+        res = vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_flowPipeline);
+    }
+    return res == VK_SUCCESS;
 }
 
 bool ComputeEngine::CreateRefinePipeline() {
@@ -198,8 +199,27 @@ bool ComputeEngine::CreateRefinePipeline() {
     vkCreatePipelineLayout(m_device, &plInfo, nullptr, &m_refinePipeLayout);
 
     VkPipelineShaderStageCreateInfo stageInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m_refineShader, "main", nullptr};
+
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT sizeControl{};
+    sizeControl.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT;
+    sizeControl.pNext = nullptr;
+    sizeControl.requiredSubgroupSize = 32;
+
+    if (ExtensionManager::Get().GetSupported().hasSubgroupSizeControl) {
+        stageInfo.pNext = &sizeControl;
+        stageInfo.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
+    }
+
     VkComputePipelineCreateInfo pipeInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, nullptr, 0, stageInfo, m_refinePipeLayout, VK_NULL_HANDLE, -1};
-    return vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_refinePipeline) == VK_SUCCESS;
+    VkResult res = vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_refinePipeline);
+
+    if (res != VK_SUCCESS) {
+        stageInfo.pNext = nullptr;
+        stageInfo.flags = 0;
+        pipeInfo.stage = stageInfo;
+        res = vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_refinePipeline);
+    }
+    return res == VK_SUCCESS;
 }
 
 bool ComputeEngine::CreateWarpPipeline() {
@@ -240,11 +260,28 @@ void ComputeEngine::EndTimestamp(VkCommandBuffer cmd) {
 }
 
 float ComputeEngine::QueryLastGpuTimeMs() {
+    const auto& cfg = SettingsManager::Get().GetSettings();
+    uint64_t gpuNs = 0, cpuNs = 0;
+
+    // Честное измерение через Calibrated Timestamps при включении
+    if (cfg.extTimestamps != 3 && ExtensionManager::Get().QueryCalibratedTimestamps(m_device, gpuNs, cpuNs, cfg.extTimestamps)) {
+        static uint64_t prevGpuNs = 0;
+        if (prevGpuNs != 0 && gpuNs > prevGpuNs) {
+            uint64_t deltaNs = gpuNs - prevGpuNs;
+            if (deltaNs > 50000 && deltaNs < 50000000) { // Фильтр выбросов
+                m_lastGpuTimeMs = static_cast<float>(deltaNs) / 1000000.0f;
+            }
+        }
+        prevGpuNs = gpuNs;
+        return m_lastGpuTimeMs;
+    }
+
+    // Fallback через QueryPool
     if (m_queryPool != VK_NULL_HANDLE) {
         uint64_t timestamps[2] = {0, 0};
         VkResult res = vkGetQueryPoolResults(
             m_device, m_queryPool, 0, 2, sizeof(timestamps), timestamps, sizeof(uint64_t), 
-            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT
+            VK_QUERY_RESULT_64_BIT
         );
         if (res == VK_SUCCESS && timestamps[1] > timestamps[0]) {
             uint64_t diffNs = static_cast<uint64_t>((timestamps[1] - timestamps[0]) * m_timestampPeriod);
