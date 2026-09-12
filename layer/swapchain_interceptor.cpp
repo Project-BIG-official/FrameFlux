@@ -1,5 +1,5 @@
 // PB FrameFlux - LGPL-2.1
-// layer/swapchain_interceptor.cpp: Safe High-Multiplier & Independent Target FPS Interceptor
+// layer/swapchain_interceptor.cpp: Safe Non-Blocking Multi-Frame Swapchain Interceptor
 
 #include <algorithm>
 #include <iostream>
@@ -73,7 +73,7 @@ static void TransitionImage(
     barrier.srcAccessMask = srcAccess;
     barrier.dstAccessMask = dstAccess;
 
-    vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    vk().CmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 }
 
 static void RecordHudOverlay(
@@ -119,6 +119,7 @@ static void RecordHudOverlay(
     uint32_t profCode = (cfg.profile == "quality") ? 1 : 0;
     uint32_t searchCode = (cfg.searchMode == "high") ? 1 : 0;
     uint32_t llCode = (cfg.lowLatency == "boost") ? 2 : ((cfg.lowLatency == "on") ? 1 : 0);
+    
     uint32_t schedCode = (cfg.targetFps > 0) ? 2 : ((cfg.schedulerMode == "fixed") ? 1 : 0);
     uint32_t fallbackCode = (cfg.fallbackAction == "repeat") ? 0 : ((cfg.fallbackAction == "drop") ? 2 : 1);
     uint32_t isMenu = HotkeyManager::Get().IsMenuOpen() ? 1 : 0;
@@ -156,7 +157,7 @@ static void RecordHudOverlay(
     memBarrier.pNext = nullptr;
     memBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     memBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+    vk().CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &memBarrier, 0, nullptr, 0, nullptr);
 
     computeEngine.RecordOverlayPass(cmd, data.overlayDescSet, opc, w, h);
 }
@@ -199,8 +200,8 @@ static void RecordFullMultiFramePipeline(
         
         TransitionImage(cmd, data.historyFrames[prevIdx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
-        vkCmdCopyImage(cmd, data.realImages[sourceGameImageIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       data.historyFrames[prevIdx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &fullCopyRegion);
+        vk().CmdCopyImage(cmd, data.realImages[sourceGameImageIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                          data.historyFrames[prevIdx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &fullCopyRegion);
         TransitionImage(cmd, data.historyFrames[prevIdx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
 
@@ -228,8 +229,8 @@ static void RecordFullMultiFramePipeline(
     TransitionImage(cmd, data.historyFrames[currIdx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
 
-    vkCmdCopyImage(cmd, data.realImages[sourceGameImageIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                   data.historyFrames[currIdx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &fullCopyRegion);
+    vk().CmdCopyImage(cmd, data.realImages[sourceGameImageIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                      data.historyFrames[currIdx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &fullCopyRegion);
 
     TransitionImage(cmd, data.historyFrames[currIdx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
@@ -318,8 +319,8 @@ static void RecordFullMultiFramePipeline(
         TransitionImage(cmd, data.realImages[subframes[s].destImageIndex], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
 
-        vkCmdCopyImage(cmd, data.generatedImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       data.realImages[subframes[s].destImageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &fullCopyRegion);
+        vk().CmdCopyImage(cmd, data.generatedImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                          data.realImages[subframes[s].destImageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &fullCopyRegion);
 
         TransitionImage(cmd, data.realImages[subframes[s].destImageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, 0);
@@ -331,8 +332,8 @@ static void RecordFullMultiFramePipeline(
         TransitionImage(cmd, data.historyFrames[currIdx], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
 
-        vkCmdCopyImage(cmd, data.historyFrames[currIdx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       data.generatedImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &fullCopyRegion);
+        vk().CmdCopyImage(cmd, data.historyFrames[currIdx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                          data.generatedImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &fullCopyRegion);
 
         TransitionImage(cmd, data.generatedImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
                         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
@@ -344,8 +345,8 @@ static void RecordFullMultiFramePipeline(
         TransitionImage(cmd, data.realImages[sourceGameImageIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
 
-        vkCmdCopyImage(cmd, data.generatedImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       data.realImages[sourceGameImageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &fullCopyRegion);
+        vk().CmdCopyImage(cmd, data.generatedImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                          data.realImages[sourceGameImageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &fullCopyRegion);
 
         TransitionImage(cmd, data.realImages[sourceGameImageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, 0);
@@ -378,8 +379,8 @@ static void RecordRealFrameOverlayPass(
     TransitionImage(cmd, data.generatedImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
 
-    vkCmdCopyImage(cmd, data.realImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                   data.generatedImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &fullCopyRegion);
+    vk().CmdCopyImage(cmd, data.realImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                      data.generatedImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &fullCopyRegion);
 
     TransitionImage(cmd, data.generatedImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
@@ -391,8 +392,8 @@ static void RecordRealFrameOverlayPass(
     TransitionImage(cmd, data.realImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
 
-    vkCmdCopyImage(cmd, data.generatedImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                   data.realImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &fullCopyRegion);
+    vk().CmdCopyImage(cmd, data.generatedImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                      data.realImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &fullCopyRegion);
 
     TransitionImage(cmd, data.realImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, 0);
@@ -436,10 +437,10 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
         imageInfo.queueFamilyIndexCount = 0;
         imageInfo.pQueueFamilyIndices = nullptr;
 
-        if (vkCreateImage(data.device, &imageInfo, nullptr, &outImg) != VK_SUCCESS) return false;
+        if (!vk(data.device).CreateImage || vk(data.device).CreateImage(data.device, &imageInfo, nullptr, &outImg) != VK_SUCCESS) return false;
 
         VkMemoryRequirements memReqs{};
-        vkGetImageMemoryRequirements(data.device, outImg, &memReqs);
+        vk(data.device).GetImageMemoryRequirements(data.device, outImg, &memReqs);
         totalAllocatedBytes += memReqs.size;
 
         VkMemoryAllocateInfo allocInfo{};
@@ -448,8 +449,8 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
         allocInfo.allocationSize = memReqs.size;
         allocInfo.memoryTypeIndex = FindMemoryType(data.memoryProperties, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
-        if (vkAllocateMemory(data.device, &allocInfo, nullptr, &outMem) != VK_SUCCESS) return false;
-        if (vkBindImageMemory(data.device, outImg, outMem, 0) != VK_SUCCESS) return false;
+        if (!vk(data.device).AllocateMemory || vk(data.device).AllocateMemory(data.device, &allocInfo, nullptr, &outMem) != VK_SUCCESS) return false;
+        if (!vk(data.device).BindImageMemory || vk(data.device).BindImageMemory(data.device, outImg, outMem, 0) != VK_SUCCESS) return false;
 
         VkImageViewCreateInfo viewInfo{};
         viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -465,7 +466,8 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
         viewInfo.subresourceRange.baseArrayLayer = 0;
         viewInfo.subresourceRange.layerCount = 1;
 
-        return vkCreateImageView(data.device, &viewInfo, nullptr, &outView) == VK_SUCCESS;
+        if (!vk(data.device).CreateImageView || vk(data.device).CreateImageView(data.device, &viewInfo, nullptr, &outView) != VK_SUCCESS) return false;
+        return true;
     };
 
     VkFormat workingFormat = data.imageFormat;
@@ -509,7 +511,7 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
     samplerInfo.maxLod = 0.0f;
     samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
     samplerInfo.unnormalizedCoordinates = VK_FALSE;
-    vkCreateSampler(data.device, &samplerInfo, nullptr, &data.linearSampler);
+    vk(data.device).CreateSampler(data.device, &samplerInfo, nullptr, &data.linearSampler);
 
     std::vector<VkDescriptorPoolSize> poolSizes = {
         {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 48},
@@ -523,7 +525,7 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
     poolInfo.maxSets = 24;
     poolInfo.poolSizeCount = (uint32_t)poolSizes.size();
     poolInfo.pPoolSizes = poolSizes.data();
-    vkCreateDescriptorPool(data.device, &poolInfo, nullptr, &data.descriptorPool);
+    vk(data.device).CreateDescriptorPool(data.device, &poolInfo, nullptr, &data.descriptorPool);
 
     auto allocSet = [&](VkDescriptorSetLayout layout, VkDescriptorSet& outSet) {
         VkDescriptorSetAllocateInfo allocSetInfo{};
@@ -532,7 +534,7 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
         allocSetInfo.descriptorPool = data.descriptorPool;
         allocSetInfo.descriptorSetCount = 1;
         allocSetInfo.pSetLayouts = &layout;
-        vkAllocateDescriptorSets(data.device, &allocSetInfo, &outSet);
+        vk(data.device).AllocateDescriptorSets(data.device, &allocSetInfo, &outSet);
     };
 
     for (uint32_t p = 0; p < 2; ++p) {
@@ -555,7 +557,7 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
         VkWriteDescriptorSet lumaWrites[2]{};
         lumaWrites[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, data.lumaDescSet[curr], 0, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &lumaImgs[0], nullptr, nullptr};
         lumaWrites[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, data.lumaDescSet[curr], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &lumaImgs[1], nullptr, nullptr};
-        vkUpdateDescriptorSets(data.device, 2, lumaWrites, 0, nullptr);
+        vk(data.device).UpdateDescriptorSets(data.device, 2, lumaWrites, 0, nullptr);
 
         VkDescriptorImageInfo downImgs[2]{
             {VK_NULL_HANDLE, data.historyLumaViews[curr],     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
@@ -564,7 +566,7 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
         VkWriteDescriptorSet downWrites[2]{};
         downWrites[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, data.downsampleDescSet[curr], 0, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &downImgs[0], nullptr, nullptr};
         downWrites[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, data.downsampleDescSet[curr], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &downImgs[1], nullptr, nullptr};
-        vkUpdateDescriptorSets(data.device, 2, downWrites, 0, nullptr);
+        vk(data.device).UpdateDescriptorSets(data.device, 2, downWrites, 0, nullptr);
 
         VkDescriptorImageInfo coarseImgs[5]{
             {VK_NULL_HANDLE, data.historyLumaHalfViews[prev], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
@@ -577,7 +579,7 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
         for (uint32_t i = 0; i < 5; ++i) {
             coarseWrites[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, data.coarseFlowDescSet[curr], i, 0, 1, (i >= 3) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &coarseImgs[i], nullptr, nullptr};
         }
-        vkUpdateDescriptorSets(data.device, 5, coarseWrites, 0, nullptr);
+        vk(data.device).UpdateDescriptorSets(data.device, 5, coarseWrites, 0, nullptr);
 
         VkDescriptorImageInfo refineImgs[5]{
             {VK_NULL_HANDLE, data.historyLumaViews[prev], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
@@ -590,7 +592,7 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
         for (uint32_t i = 0; i < 5; ++i) {
             refineWrites[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, data.refineDescSet[curr], i, 0, 1, (i >= 3) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &refineImgs[i], nullptr, nullptr};
         }
-        vkUpdateDescriptorSets(data.device, 5, refineWrites, 0, nullptr);
+        vk(data.device).UpdateDescriptorSets(data.device, 5, refineWrites, 0, nullptr);
 
         VkDescriptorImageInfo directImgs[5]{
             {VK_NULL_HANDLE, data.historyLumaViews[prev], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
@@ -603,7 +605,7 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
         for (uint32_t i = 0; i < 5; ++i) {
             directWrites[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, data.directFlowDescSet[curr], i, 0, 1, (i >= 3) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &directImgs[i], nullptr, nullptr};
         }
-        vkUpdateDescriptorSets(data.device, 5, directWrites, 0, nullptr);
+        vk(data.device).UpdateDescriptorSets(data.device, 5, directWrites, 0, nullptr);
 
         VkDescriptorImageInfo warpImgs[6]{
             {VK_NULL_HANDLE, data.historyFrameViews[prev], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
@@ -617,12 +619,12 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
         for (uint32_t i = 0; i < 6; ++i) {
             warpWrites[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, data.warpDescSet[curr], i, 0, 1, (i == 4) ? VK_DESCRIPTOR_TYPE_SAMPLER : ((i == 5) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE), &warpImgs[i], nullptr, nullptr};
         }
-        vkUpdateDescriptorSets(data.device, 6, warpWrites, 0, nullptr);
+        vk(data.device).UpdateDescriptorSets(data.device, 6, warpWrites, 0, nullptr);
     }
 
     VkDescriptorImageInfo overlayImg{VK_NULL_HANDLE, data.generatedView, VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet overlayWrite{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, data.overlayDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &overlayImg, nullptr, nullptr};
-    vkUpdateDescriptorSets(data.device, 1, &overlayWrite, 0, nullptr);
+    vk(data.device).UpdateDescriptorSets(data.device, 1, &overlayWrite, 0, nullptr);
 
     VkCommandBufferAllocateInfo cmdAllocInfo{};
     cmdAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -643,16 +645,16 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
 
     for (uint32_t slot = 0; slot < MAX_FRAMES_IN_FLIGHT; ++slot) {
         std::vector<VkCommandBuffer> bufs(MAX_MULTIPLIER_FRAMES + 1);
-        vkAllocateCommandBuffers(data.device, &cmdAllocInfo, bufs.data());
+        vk(data.device).AllocateCommandBuffers(data.device, &cmdAllocInfo, bufs.data());
         for (uint32_t m = 0; m < MAX_MULTIPLIER_FRAMES; ++m) {
             data.frameSlots[slot].genCommandBuffers[m] = bufs[m];
-            vkCreateSemaphore(data.device, &semInfo, nullptr, &data.frameSlots[slot].genDoneSemaphores[m]);
-            vkCreateSemaphore(data.device, &semInfo, nullptr, &data.frameSlots[slot].acquireSemaphores[m]);
+            vk(data.device).CreateSemaphore(data.device, &semInfo, nullptr, &data.frameSlots[slot].genDoneSemaphores[m]);
+            vk(data.device).CreateSemaphore(data.device, &semInfo, nullptr, &data.frameSlots[slot].acquireSemaphores[m]);
         }
         data.frameSlots[slot].realCommandBuffer = bufs[MAX_MULTIPLIER_FRAMES];
 
-        vkCreateFence(data.device, &fenceInfo, nullptr, &data.frameSlots[slot].frameFence);
-        vkCreateSemaphore(data.device, &semInfo, nullptr, &data.frameSlots[slot].realDoneSemaphore);
+        vk(data.device).CreateFence(data.device, &fenceInfo, nullptr, &data.frameSlots[slot].frameFence);
+        vk(data.device).CreateSemaphore(data.device, &semInfo, nullptr, &data.frameSlots[slot].realDoneSemaphore);
     }
 
     data.buffersAllocated = true;
@@ -664,21 +666,29 @@ void Interceptor::CleanupSwapchainData(SwapchainData& data) {
     if (data.device == VK_NULL_HANDLE) return;
 
     for (uint32_t slot = 0; slot < MAX_FRAMES_IN_FLIGHT; ++slot) {
-        if (data.frameSlots[slot].frameFence != VK_NULL_HANDLE) vkDestroyFence(data.device, data.frameSlots[slot].frameFence, nullptr);
-        for (uint32_t m = 0; m < MAX_MULTIPLIER_FRAMES; ++m) {
-            if (data.frameSlots[slot].genDoneSemaphores[m] != VK_NULL_HANDLE) vkDestroySemaphore(data.device, data.frameSlots[slot].genDoneSemaphores[m], nullptr);
-            if (data.frameSlots[slot].acquireSemaphores[m] != VK_NULL_HANDLE) vkDestroySemaphore(data.device, data.frameSlots[slot].acquireSemaphores[m], nullptr);
+        if (data.frameSlots[slot].frameFence != VK_NULL_HANDLE && vk(data.device).DestroyFence) {
+            vk(data.device).DestroyFence(data.device, data.frameSlots[slot].frameFence, nullptr);
         }
-        if (data.frameSlots[slot].realDoneSemaphore != VK_NULL_HANDLE) vkDestroySemaphore(data.device, data.frameSlots[slot].realDoneSemaphore, nullptr);
+        for (uint32_t m = 0; m < MAX_MULTIPLIER_FRAMES; ++m) {
+            if (data.frameSlots[slot].genDoneSemaphores[m] != VK_NULL_HANDLE && vk(data.device).DestroySemaphore) {
+                vk(data.device).DestroySemaphore(data.device, data.frameSlots[slot].genDoneSemaphores[m], nullptr);
+            }
+            if (data.frameSlots[slot].acquireSemaphores[m] != VK_NULL_HANDLE && vk(data.device).DestroySemaphore) {
+                vk(data.device).DestroySemaphore(data.device, data.frameSlots[slot].acquireSemaphores[m], nullptr);
+            }
+        }
+        if (data.frameSlots[slot].realDoneSemaphore != VK_NULL_HANDLE && vk(data.device).DestroySemaphore) {
+            vk(data.device).DestroySemaphore(data.device, data.frameSlots[slot].realDoneSemaphore, nullptr);
+        }
     }
 
-    if (data.linearSampler != VK_NULL_HANDLE) vkDestroySampler(data.device, data.linearSampler, nullptr);
-    if (data.descriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(data.device, data.descriptorPool, nullptr);
+    if (data.linearSampler != VK_NULL_HANDLE && vk(data.device).DestroySampler) vk(data.device).DestroySampler(data.device, data.linearSampler, nullptr);
+    if (data.descriptorPool != VK_NULL_HANDLE && vk(data.device).DestroyDescriptorPool) vk(data.device).DestroyDescriptorPool(data.device, data.descriptorPool, nullptr);
 
     auto destroyTex = [&](VkImage img, VkDeviceMemory mem, VkImageView view) {
-        if (view != VK_NULL_HANDLE) vkDestroyImageView(data.device, view, nullptr);
-        if (img != VK_NULL_HANDLE) vkDestroyImage(data.device, img, nullptr);
-        if (mem != VK_NULL_HANDLE) vkFreeMemory(data.device, mem, nullptr);
+        if (view != VK_NULL_HANDLE && vk(data.device).DestroyImageView) vk(data.device).DestroyImageView(data.device, view, nullptr);
+        if (img != VK_NULL_HANDLE && vk(data.device).DestroyImage) vk(data.device).DestroyImage(data.device, img, nullptr);
+        if (mem != VK_NULL_HANDLE && vk(data.device).FreeMemory) vk(data.device).FreeMemory(data.device, mem, nullptr);
     };
 
     for (uint32_t i = 0; i < 2; ++i) {
@@ -693,7 +703,7 @@ void Interceptor::CleanupSwapchainData(SwapchainData& data) {
     destroyTex(data.confidenceImage, data.confidenceMemory, data.confidenceView);
     destroyTex(data.generatedImage, data.generatedMemory, data.generatedView);
 
-    if (data.commandPool != VK_NULL_HANDLE) vkDestroyCommandPool(data.device, data.commandPool, nullptr);
+    if (data.commandPool != VK_NULL_HANDLE && vk(data.device).DestroyCommandPool) vk(data.device).DestroyCommandPool(data.device, data.commandPool, nullptr);
 }
 
 VkResult Interceptor::OnCreateSwapchainKHR(
@@ -709,20 +719,15 @@ VkResult Interceptor::OnCreateSwapchainKHR(
 
     SettingsManager::Get().LoadOrCreate();
 
-    // -------------------------------------------------------------------------
-    // БЕЗОПАСНЫЙ ЕДИНИЧНЫЙ ВЫЗОВ (БЕЗ ЦИКЛА, КОТОРЫЙ УБИВАЛ ДЕСКРИПТОР ОКНА В WINE)
-    // -------------------------------------------------------------------------
     VkSwapchainCreateInfoKHR modifiedCreateInfo = *pCreateInfo;
     modifiedCreateInfo.imageUsage |= (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
 
-    // Безопасно расширяем до 5-6 образов (хватает для 4x/6x и не превышает лимит X11/Wine)
     if (modifiedCreateInfo.minImageCount < 5) {
         modifiedCreateInfo.minImageCount = std::max(modifiedCreateInfo.minImageCount + 2u, 5u);
     }
 
     VkResult result = realFunc(device, &modifiedCreateInfo, pAllocator, pSwapchain);
     if (result != VK_SUCCESS) {
-        // Запасной вызов строго с оригинальными параметрами игры
         result = realFunc(device, pCreateInfo, pAllocator, pSwapchain);
         if (result != VK_SUCCESS) return result;
     }
@@ -745,18 +750,23 @@ VkResult Interceptor::OnCreateSwapchainKHR(
     data->lastPresentExitTime = std::chrono::high_resolution_clock::now();
 
     uint32_t imageCount = 0;
-    vkGetSwapchainImagesKHR(device, *pSwapchain, &imageCount, nullptr);
-    if (imageCount == 0) return VK_SUCCESS;
+    if (vk(device).GetSwapchainImagesKHR) {
+        vk(device).GetSwapchainImagesKHR(device, *pSwapchain, &imageCount, nullptr);
+        if (imageCount == 0) return VK_SUCCESS;
 
-    data->realImages.resize(imageCount);
-    vkGetSwapchainImagesKHR(device, *pSwapchain, &imageCount, data->realImages.data());
+        data->realImages.resize(imageCount);
+        vk(device).GetSwapchainImagesKHR(device, *pSwapchain, &imageCount, data->realImages.data());
+    }
 
     VkCommandPoolCreateInfo cmdPoolInfo{};
     cmdPoolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     cmdPoolInfo.pNext = nullptr;
     cmdPoolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     cmdPoolInfo.queueFamilyIndex = m_cachedQueueFamily;
-    vkCreateCommandPool(device, &cmdPoolInfo, nullptr, &data->commandPool);
+    
+    if (vk(device).CreateCommandPool) {
+        vk(device).CreateCommandPool(device, &cmdPoolInfo, nullptr, &data->commandPool);
+    }
 
     AllocateFrameBuffers(*data);
 
@@ -805,20 +815,20 @@ VkResult Interceptor::OnQueuePresentKHR(
                     uint32_t slot = data.currentFlightSlot;
                     FrameFlightResources& res = data.frameSlots[slot];
 
-                    vkWaitForFences(data.device, 1, &res.frameFence, VK_TRUE, UINT64_MAX);
-                    vkResetFences(data.device, 1, &res.frameFence);
+                    vk(data.device).WaitForFences(data.device, 1, &res.frameFence, VK_TRUE, UINT64_MAX);
+                    vk(data.device).ResetFences(data.device, 1, &res.frameFence);
 
                     VkCommandBuffer realCmd = res.realCommandBuffer;
-                    vkResetCommandBuffer(realCmd, 0);
+                    vk(data.device).ResetCommandBuffer(realCmd, 0);
                     VkCommandBufferBeginInfo bInfo{};
                     bInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
                     bInfo.pNext = nullptr;
                     bInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-                    vkBeginCommandBuffer(realCmd, &bInfo);
+                    vk(data.device).BeginCommandBuffer(realCmd, &bInfo);
 
                     RecordRealFrameOverlayPass(data, realCmd, pPresentInfo->pImageIndices[i], m_computeEngine, honestOutputFpsX10);
 
-                    vkEndCommandBuffer(realCmd);
+                    vk(data.device).EndCommandBuffer(realCmd);
 
                     std::vector<VkSemaphore> waitSems;
                     std::vector<VkPipelineStageFlags> waitStages;
@@ -840,7 +850,7 @@ VkResult Interceptor::OnQueuePresentKHR(
                     realSubmit.signalSemaphoreCount = 1;
                     realSubmit.pSignalSemaphores = &res.realDoneSemaphore;
 
-                    vkQueueSubmit(queue, 1, &realSubmit, res.frameFence);
+                    vk(data.device).QueueSubmit(queue, 1, &realSubmit, res.frameFence);
 
                     VkPresentInfoKHR presentReal = *pPresentInfo;
                     presentReal.waitSemaphoreCount = 1;
@@ -854,13 +864,10 @@ VkResult Interceptor::OnQueuePresentKHR(
 
             data.frameCounter++;
 
-            // 1. БЕЗОПАСНЫЙ PRESENT WAIT: вызывается ТОЛЬКО если юзер явно включил режим 1 или 2
-            // По умолчанию (0=Auto или 3=Disabled) вызов блокирующего ожидания ЗАПРЕЩЕН
             if ((cfg.extPresentWait == 1 || cfg.extPresentWait == 2) && data.frameCounter > 10) {
                 ExtensionManager::Get().WaitForPresentQueue(data.device, data.swapchain, data.frameCounter - 1, cfg.extPresentWait);
             }
 
-            // 2. Неблокирующие маркеры Low Latency
             if (cfg.lowLatency != "off") {
                 ExtensionManager::Get().MarkAntiLagStage(data.device, VK_ANTI_LAG_STAGE_PRESENT_AMD, data.frameCounter, cfg.extLowLatency);
                 ExtensionManager::Get().MarkReflexMarker(data.device, data.swapchain, VK_LATENCY_MARKER_PRESENT_START_NV, data.frameCounter, cfg.extLowLatency);
@@ -885,16 +892,12 @@ VkResult Interceptor::OnQueuePresentKHR(
 
             float nativeFps = 1000.0f / std::max(1.0f, data.smoothedFrametimeMs);
 
-            // -----------------------------------------------------------------
-            // ЧЕСТНЫЙ И НЕЗАВИСИМЫЙ TARGET FPS
-            // -----------------------------------------------------------------
             bool isTargetFpsMode = (cfg.targetFps > 0 && cfg.schedulerMode != "fixed");
             uint32_t subframesToGenerate = 0;
 
             if (isTargetFpsMode) {
                 float targetFpsF = static_cast<float>(cfg.targetFps);
                 if (nativeFps >= (targetFpsF * 0.98f)) {
-                    // Игра уже выдает нужный FPS: сабкадры не нужны
                     data.fractionalDebt = 0.0f;
                     subframesToGenerate = 0;
                 } else {
@@ -903,26 +906,21 @@ VkResult Interceptor::OnQueuePresentKHR(
                     data.fractionalDebt += extraNeeded;
 
                     uint32_t requested = static_cast<uint32_t>(data.fractionalDebt);
-                    // Разрешаем до 5 сабкадров (до 6x)
                     subframesToGenerate = std::min(requested, 5u);
                 }
             } else {
-                // Если Target FPS выключен, работает строго множитель
                 uint32_t activeMultiplier = std::clamp(cfg.multiplier, 2u, 6u);
                 subframesToGenerate = activeMultiplier - 1;
             }
 
             uint32_t realGameImageIndex = pPresentInfo->pImageIndices[i];
 
-// -----------------------------------------------------------------
-            // НАДЕЖНЫЙ ЗАХВАТ САБКАДРОВ (0.5 мс таймаут позволяет брать 4x/6x без задержек)
-            // -----------------------------------------------------------------
             std::vector<SubframeTask> tasks;
-            if (subframesToGenerate > 0) {
+            if (subframesToGenerate > 0 && vk(data.device).AcquireNextImageKHR) {
                 for (uint32_t m = 0; m < subframesToGenerate; ++m) {
                     uint32_t genImg = 0;
-                    VkResult acq = vkAcquireNextImageKHR(
-                        data.device, data.swapchain, 500000ULL, // 0.5 мс таймаут
+                    VkResult acq = vk(data.device).AcquireNextImageKHR(
+                        data.device, data.swapchain, 500000ULL,
                         res.acquireSemaphores[m], VK_NULL_HANDLE, &genImg
                     );
 
@@ -958,20 +956,20 @@ VkResult Interceptor::OnQueuePresentKHR(
 
             if (tasks.empty()) {
                 if (cfg.hudMode != 0 || HotkeyManager::Get().IsMenuOpen() || cfg.debugVisual > 0) {
-                    vkWaitForFences(data.device, 1, &res.frameFence, VK_TRUE, UINT64_MAX);
-                    vkResetFences(data.device, 1, &res.frameFence);
+                    vk(data.device).WaitForFences(data.device, 1, &res.frameFence, VK_TRUE, UINT64_MAX);
+                    vk(data.device).ResetFences(data.device, 1, &res.frameFence);
 
                     VkCommandBuffer realCmd = res.realCommandBuffer;
-                    vkResetCommandBuffer(realCmd, 0);
+                    vk(data.device).ResetCommandBuffer(realCmd, 0);
                     VkCommandBufferBeginInfo bInfo{};
                     bInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
                     bInfo.pNext = nullptr;
                     bInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-                    vkBeginCommandBuffer(realCmd, &bInfo);
+                    vk(data.device).BeginCommandBuffer(realCmd, &bInfo);
 
                     RecordRealFrameOverlayPass(data, realCmd, pPresentInfo->pImageIndices[i], m_computeEngine, honestOutputFpsX10);
 
-                    vkEndCommandBuffer(realCmd);
+                    vk(data.device).EndCommandBuffer(realCmd);
 
                     std::vector<VkSemaphore> waitSems;
                     std::vector<VkPipelineStageFlags> waitStages;
@@ -993,7 +991,7 @@ VkResult Interceptor::OnQueuePresentKHR(
                     realSubmit.signalSemaphoreCount = 1;
                     realSubmit.pSignalSemaphores = &res.realDoneSemaphore;
 
-                    vkQueueSubmit(queue, 1, &realSubmit, res.frameFence);
+                    vk(data.device).QueueSubmit(queue, 1, &realSubmit, res.frameFence);
 
                     VkPresentInfoKHR presentReal = *pPresentInfo;
                     presentReal.waitSemaphoreCount = 1;
@@ -1010,22 +1008,22 @@ VkResult Interceptor::OnQueuePresentKHR(
                 tasks[k].t = stepT * static_cast<float>(k + 1);
             }
 
-            vkWaitForFences(data.device, 1, &res.frameFence, VK_TRUE, UINT64_MAX);
-            vkResetFences(data.device, 1, &res.frameFence);
+            vk(data.device).WaitForFences(data.device, 1, &res.frameFence, VK_TRUE, UINT64_MAX);
+            vk(data.device).ResetFences(data.device, 1, &res.frameFence);
 
             VkCommandBuffer genCmd = res.genCommandBuffers[0];
-            vkResetCommandBuffer(genCmd, 0);
+            vk(data.device).ResetCommandBuffer(genCmd, 0);
 
             VkCommandBufferBeginInfo beginInfo{};
             beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
             beginInfo.pNext = nullptr;
             beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            vkBeginCommandBuffer(genCmd, &beginInfo);
+            vk(data.device).BeginCommandBuffer(genCmd, &beginInfo);
 
             uint32_t totalFramesDisplayed = static_cast<uint32_t>(tasks.size() + 1);
             RecordFullMultiFramePipeline(data, genCmd, realGameImageIndex, tasks, m_computeEngine, totalFramesDisplayed, trueFrameDeltaMs, honestOutputFpsX10);
 
-            vkEndCommandBuffer(genCmd);
+            vk(data.device).EndCommandBuffer(genCmd);
 
             std::vector<VkSemaphore> waitSems;
             std::vector<VkPipelineStageFlags> waitStages;
@@ -1033,7 +1031,7 @@ VkResult Interceptor::OnQueuePresentKHR(
             if (pPresentInfo->waitSemaphoreCount > 0 && pPresentInfo->pWaitSemaphores) {
                 for (uint32_t s = 0; s < pPresentInfo->waitSemaphoreCount; ++s) {
                     waitSems.push_back(pPresentInfo->pWaitSemaphores[s]);
-                    waitStages.push_back(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+                    waitStages.push_back(VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
                 }
             }
             for (size_t k = 0; k < tasks.size(); ++k) {
@@ -1066,7 +1064,7 @@ VkResult Interceptor::OnQueuePresentKHR(
             genSubmit.signalSemaphoreCount = static_cast<uint32_t>(signalSems.size());
             genSubmit.pSignalSemaphores = signalSems.data();
 
-            vkQueueSubmit(queue, 1, &genSubmit, res.frameFence);
+            vk(data.device).QueueSubmit(queue, 1, &genSubmit, res.frameFence);
 
             for (size_t k = 0; k < tasks.size(); ++k) {
                 VkPresentInfoKHR presentG{};

@@ -1,358 +1,340 @@
 // PB FrameFlux - LGPL-2.1
-// layer/layer_entrypoints.cpp: Robust Wine/DXVK/Native Vulkan Interceptor
+// layer/compute_engine.cpp: Subgroup Wave32 Control & Safe Dispatch
 
-#include <vulkan/vulkan.h>
-#include <vulkan/vk_layer.h>
-#include "swapchain_interceptor.hpp"
-#include "vulkan_extensions.hpp"
+#include "compute_engine.hpp"
 #include "vulkan_dispatch.hpp"
 
-#include <unordered_map>
-#include <mutex>
+#include "warp_interpolate_spv.hpp"
+#include "flow_search_dp4a_spv.hpp"
+#include "luma_pack_spv.hpp"
+#include "flow_downsample_spv.hpp"
+#include "flow_refine_subgroup_spv.hpp"
+#include "vulkan_extensions.hpp"
+#include "overlay_hud_spv.hpp"
+
+#include <iostream>
 #include <vector>
 #include <cstring>
-#include <iostream>
-
-#ifdef VK_LAYER_EXPORT
-#undef VK_LAYER_EXPORT
-#endif
-#define VK_LAYER_EXPORT extern "C" __attribute__((visibility("default"), used))
 
 namespace FrameFlux {
 
-static VkPhysicalDeviceMemoryProperties g_deviceMemoryProperties{};
-static uint32_t g_graphicsQueueFamilyIndex = 0;
+static VkShaderModule CreateShaderModule(VkDevice device, const uint8_t* byteCode, size_t codeSize) {
+    if (!device || !byteCode || codeSize == 0) return VK_NULL_HANDLE;
 
-struct InstanceDispatch {
-    PFN_vkGetInstanceProcAddr GetInstanceProcAddr = nullptr;
-    PFN_vkDestroyInstance DestroyInstance = nullptr;
-    PFN_vkGetPhysicalDeviceMemoryProperties GetPhysicalDeviceMemoryProperties = nullptr;
-};
+    std::vector<uint32_t> alignedCode((codeSize + 3) / 4);
+    std::memcpy(alignedCode.data(), byteCode, codeSize);
 
-struct DeviceDispatch {
-    PFN_vkGetDeviceProcAddr GetDeviceProcAddr = nullptr;
-    PFN_vkDestroyDevice DestroyDevice = nullptr;
-    PFN_vkCreateSwapchainKHR CreateSwapchainKHR = nullptr;
-    PFN_vkDestroySwapchainKHR DestroySwapchainKHR = nullptr;
-    PFN_vkQueuePresentKHR QueuePresentKHR = nullptr;
-};
-
-static std::unordered_map<void*, InstanceDispatch> g_instanceDispatches;
-static std::unordered_map<void*, DeviceDispatch> g_deviceDispatches;
-static InstanceDispatch g_globalInstanceDispatch{};
-static DeviceDispatch g_globalDeviceDispatch{};
-static std::mutex g_dispatchLock;
-
-template <typename DispatchableType>
-void* GetDispatchKey(DispatchableType inst) {
-    if (!inst) return nullptr;
-    return *(void**)inst;
+    VkShaderModuleCreateInfo smInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, nullptr, 0, codeSize, alignedCode.data()};
+    VkShaderModule module = VK_NULL_HANDLE;
+    if (vk(device).CreateShaderModule) {
+        vk(device).CreateShaderModule(device, &smInfo, nullptr, &module);
+    }
+    return module;
 }
 
-static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateSwapchainKHR(
-    VkDevice device,
-    const VkSwapchainCreateInfoKHR* pCreateInfo,
-    const VkAllocationCallbacks* pAllocator,
-    VkSwapchainKHR* pSwapchain
-) {
-    if (!device || !pCreateInfo || !pSwapchain) {
-        return VK_ERROR_INITIALIZATION_FAILED;
-    }
-
-    PFN_vkCreateSwapchainKHR realFunc = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(g_dispatchLock);
-        void* key = GetDispatchKey(device);
-        auto it = g_deviceDispatches.find(key);
-        realFunc = (it != g_deviceDispatches.end() && it->second.CreateSwapchainKHR) ? it->second.CreateSwapchainKHR : g_globalDeviceDispatch.CreateSwapchainKHR;
-    }
-
-    if (!realFunc) return VK_ERROR_INITIALIZATION_FAILED;
-    return Interceptor::Get().OnCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain, realFunc);
+ComputeEngine::~ComputeEngine() {
+    Cleanup();
 }
 
-static VKAPI_ATTR void VKAPI_CALL Hook_DestroySwapchainKHR(
-    VkDevice device,
-    VkSwapchainKHR swapchain,
-    const VkAllocationCallbacks* pAllocator
-) {
-    PFN_vkDestroySwapchainKHR realFunc = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(g_dispatchLock);
-        void* key = GetDispatchKey(device);
-        auto it = g_deviceDispatches.find(key);
-        realFunc = (it != g_deviceDispatches.end()) ? it->second.DestroySwapchainKHR : g_globalDeviceDispatch.DestroySwapchainKHR;
+bool ComputeEngine::Initialize(VkDevice device, float timestampPeriod) {
+    m_device = device;
+    m_timestampPeriod = (timestampPeriod > 0.0f) ? timestampPeriod : 1.0f;
+
+    VkQueryPoolCreateInfo qpInfo{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, nullptr, 0, VK_QUERY_TYPE_TIMESTAMP, 2, 0};
+    if (vk(m_device).CreateQueryPool) {
+        vk(m_device).CreateQueryPool(m_device, &qpInfo, nullptr, &m_queryPool);
     }
 
-    if (realFunc) {
-        Interceptor::Get().OnDestroySwapchainKHR(device, swapchain, pAllocator, realFunc);
-    }
+    return CreateLumaPipeline() && 
+           CreateDownsamplePipeline() && 
+           CreateFlowPipeline() && 
+           CreateRefinePipeline() && 
+           CreateWarpPipeline() && 
+           CreateOverlayPipeline();
 }
 
-static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(
-    VkQueue queue,
-    const VkPresentInfoKHR* pPresentInfo
-) {
-    PFN_vkQueuePresentKHR realFunc = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(g_dispatchLock);
-        void* key = GetDispatchKey(queue);
-        auto it = g_deviceDispatches.find(key);
-        realFunc = (it != g_deviceDispatches.end()) ? it->second.QueuePresentKHR : g_globalDeviceDispatch.QueuePresentKHR;
-    }
+bool ComputeEngine::CreateOverlayPipeline() {
+    m_overlayShader = CreateShaderModule(m_device, overlay_hud_spv, overlay_hud_spv_size);
+    if (!m_overlayShader) return false;
 
-    if (!realFunc) return VK_ERROR_INITIALIZATION_FAILED;
-    return Interceptor::Get().OnQueuePresentKHR(queue, pPresentInfo, realFunc);
+    std::vector<VkDescriptorSetLayoutBinding> bindings = {
+        {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}
+    };
+    VkDescriptorSetLayoutCreateInfo dlInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, (uint32_t)bindings.size(), bindings.data()};
+    vk(m_device).CreateDescriptorSetLayout(m_device, &dlInfo, nullptr, &m_overlayDescLayout);
+
+    VkPushConstantRange pcRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(OverlayPushConstants)};
+    VkPipelineLayoutCreateInfo plInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0, 1, &m_overlayDescLayout, 1, &pcRange};
+    vk(m_device).CreatePipelineLayout(m_device, &plInfo, nullptr, &m_overlayPipeLayout);
+
+    VkPipelineShaderStageCreateInfo stageInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m_overlayShader, "main", nullptr};
+    VkComputePipelineCreateInfo pipeInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, nullptr, 0, stageInfo, m_overlayPipeLayout, VK_NULL_HANDLE, -1};
+    return vk(m_device).CreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_overlayPipeline) == VK_SUCCESS;
 }
 
-static VKAPI_ATTR void VKAPI_CALL Hook_GetPhysicalDeviceMemoryProperties(
-    VkPhysicalDevice physicalDevice,
-    VkPhysicalDeviceMemoryProperties* pMemoryProperties
-) {
-    PFN_vkGetPhysicalDeviceMemoryProperties realFunc = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(g_dispatchLock);
-        void* key = GetDispatchKey(physicalDevice);
-        auto it = g_instanceDispatches.find(key);
-        if (it != g_instanceDispatches.end() && it->second.GetPhysicalDeviceMemoryProperties) {
-            realFunc = it->second.GetPhysicalDeviceMemoryProperties;
-        } else {
-            realFunc = g_globalInstanceDispatch.GetPhysicalDeviceMemoryProperties;
-        }
-    }
-
-    if (realFunc) {
-        realFunc(physicalDevice, pMemoryProperties);
-        g_deviceMemoryProperties = *pMemoryProperties;
-    }
+void ComputeEngine::RecordOverlayPass(VkCommandBuffer cmd, VkDescriptorSet descSet, const OverlayPushConstants& pc, uint32_t width, uint32_t height) {
+    vk().CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_overlayPipeline);
+    vk().CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_overlayPipeLayout, 0, 1, &descSet, 0, nullptr);
+    vk().CmdPushConstants(cmd, m_overlayPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(OverlayPushConstants), &pc);
+    vk().CmdDispatch(cmd, (width + 15) / 16, (height + 15) / 16, 1);
 }
 
-static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateInstance(
-    const VkInstanceCreateInfo* pCreateInfo,
-    const VkAllocationCallbacks* pAllocator,
-    VkInstance* pInstance
-) {
-    if (!pCreateInfo || !pInstance) return VK_ERROR_INITIALIZATION_FAILED;
+void ComputeEngine::Cleanup() {
+    if (m_device == VK_NULL_HANDLE) return;
 
-    VkLayerInstanceCreateInfo* chainInfo = (VkLayerInstanceCreateInfo*)pCreateInfo->pNext;
-    while (chainInfo && (chainInfo->sType != VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO ||
-                         chainInfo->function != VK_LAYER_LINK_INFO)) {
-        chainInfo = (VkLayerInstanceCreateInfo*)chainInfo->pNext;
+    if (m_queryPool != VK_NULL_HANDLE && vk(m_device).DestroyQueryPool) {
+        vk(m_device).DestroyQueryPool(m_device, m_queryPool, nullptr);
+        m_queryPool = VK_NULL_HANDLE;
     }
 
-    if (!chainInfo || !chainInfo->u.pLayerInfo) return VK_ERROR_INITIALIZATION_FAILED;
-
-    PFN_vkGetInstanceProcAddr nextGIPA = chainInfo->u.pLayerInfo->pfnNextGetInstanceProcAddr;
-    if (!nextGIPA) return VK_ERROR_INITIALIZATION_FAILED;
-
-    PFN_vkCreateInstance realCreateInstance = (PFN_vkCreateInstance)nextGIPA(VK_NULL_HANDLE, "vkCreateInstance");
-    if (!realCreateInstance) return VK_ERROR_INITIALIZATION_FAILED;
-
-    chainInfo->u.pLayerInfo = chainInfo->u.pLayerInfo->pNext;
-
-    VkResult res = realCreateInstance(pCreateInfo, pAllocator, pInstance);
-    if (res != VK_SUCCESS) return res;
-
-    InstanceDispatch dispatch{};
-    dispatch.GetInstanceProcAddr = nextGIPA;
-    dispatch.DestroyInstance = (PFN_vkDestroyInstance)nextGIPA(*pInstance, "vkDestroyInstance");
-    dispatch.GetPhysicalDeviceMemoryProperties = (PFN_vkGetPhysicalDeviceMemoryProperties)nextGIPA(*pInstance, "vkGetPhysicalDeviceMemoryProperties");
-
-    {
-        std::lock_guard<std::mutex> lock(g_dispatchLock);
-        g_instanceDispatches[GetDispatchKey(*pInstance)] = dispatch;
-        g_globalInstanceDispatch = dispatch;
-    }
-
-    return VK_SUCCESS;
-}
-
-static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
-    VkPhysicalDevice physicalDevice,
-    const VkDeviceCreateInfo* pCreateInfo,
-    const VkAllocationCallbacks* pAllocator,
-    VkDevice* pDevice
-) {
-    if (!physicalDevice || !pCreateInfo || !pDevice) {
-        return VK_ERROR_INITIALIZATION_FAILED;
-    }
-
-    std::cout << "[PB FrameFlux Hook] vkCreateDevice intercepted!" << std::endl;
-
-    if (pCreateInfo->queueCreateInfoCount > 0 && pCreateInfo->pQueueCreateInfos) {
-        g_graphicsQueueFamilyIndex = pCreateInfo->pQueueCreateInfos[0].queueFamilyIndex;
-    }
-
-    VkLayerDeviceCreateInfo* chainInfo = (VkLayerDeviceCreateInfo*)pCreateInfo->pNext;
-    while (chainInfo && (chainInfo->sType != VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO ||
-                         chainInfo->function != VK_LAYER_LINK_INFO)) {
-        chainInfo = (VkLayerDeviceCreateInfo*)chainInfo->pNext;
-    }
-
-    if (!chainInfo || !chainInfo->u.pLayerInfo) return VK_ERROR_INITIALIZATION_FAILED;
-
-    PFN_vkGetInstanceProcAddr nextGIPA = chainInfo->u.pLayerInfo->pfnNextGetInstanceProcAddr;
-    PFN_vkGetDeviceProcAddr nextGDPA = chainInfo->u.pLayerInfo->pfnNextGetDeviceProcAddr;
-    
-    if (!nextGIPA || !nextGDPA) return VK_ERROR_INITIALIZATION_FAILED;
-
-    // ВАЖНО: Всегда передаем VK_NULL_HANDLE в nextGIPA для поиска функции создания устройства
-    PFN_vkCreateDevice realCreateDevice = (PFN_vkCreateDevice)nextGIPA(VK_NULL_HANDLE, "vkCreateDevice");
-    if (!realCreateDevice) {
-        std::lock_guard<std::mutex> lock(g_dispatchLock);
-        if (g_globalInstanceDispatch.GetInstanceProcAddr) {
-            realCreateDevice = (PFN_vkCreateDevice)g_globalInstanceDispatch.GetInstanceProcAddr(VK_NULL_HANDLE, "vkCreateDevice");
-        }
-    }
-    if (!realCreateDevice) return VK_ERROR_INITIALIZATION_FAILED;
-
-    // Продвигаем цепочку загрузчика
-    chainInfo->u.pLayerInfo = chainInfo->u.pLayerInfo->pNext;
-
-    // Опрашиваем физический GPU
-    PFN_vkEnumerateDeviceExtensionProperties pfnEnum = 
-        (PFN_vkEnumerateDeviceExtensionProperties)nextGIPA(VK_NULL_HANDLE, "vkEnumerateDeviceExtensionProperties");
-    if (pfnEnum) {
-        ExtensionManager::Get().CollectGpuExtensions(physicalDevice, pfnEnum);
-    }
-
-    // Собираем список расширений
-    std::vector<const char*> enabledExts;
-    if (pCreateInfo->ppEnabledExtensionNames) {
-        for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; ++i) {
-            enabledExts.push_back(pCreateInfo->ppEnabledExtensionNames[i]);
-            ExtensionManager::Get().NotifyExtensionActivated(pCreateInfo->ppEnabledExtensionNames[i]);
-        }
-    }
-
-    auto tryInjectExt = [&](const char* extName) -> bool {
-        if (ExtensionManager::Get().IsDeviceExtensionSupportedByGPU(extName)) {
-            for (const char* existing : enabledExts) {
-                if (strcmp(existing, extName) == 0) return true;
-            }
-            enabledExts.push_back(extName);
-            ExtensionManager::Get().NotifyExtensionActivated(extName);
-            return true;
-        }
-        return false;
+    auto destroyPipe = [this](VkPipeline& p, VkPipelineLayout& pl, VkDescriptorSetLayout& dl, VkShaderModule& sm) {
+        if (p != VK_NULL_HANDLE && vk(m_device).DestroyPipeline) { vk(m_device).DestroyPipeline(m_device, p, nullptr); p = VK_NULL_HANDLE; }
+        if (pl != VK_NULL_HANDLE && vk(m_device).DestroyPipelineLayout) { vk(m_device).DestroyPipelineLayout(m_device, pl, nullptr); pl = VK_NULL_HANDLE; }
+        if (dl != VK_NULL_HANDLE && vk(m_device).DestroyDescriptorSetLayout) { vk(m_device).DestroyDescriptorSetLayout(m_device, dl, nullptr); dl = VK_NULL_HANDLE; }
+        if (sm != VK_NULL_HANDLE && vk(m_device).DestroyShaderModule) { vk(m_device).DestroyShaderModule(m_device, sm, nullptr); sm = VK_NULL_HANDLE; }
     };
 
-    tryInjectExt("VK_KHR_calibrated_timestamps");
-    tryInjectExt("VK_EXT_calibrated_timestamps");
-    tryInjectExt("VK_EXT_present_timing");
-    tryInjectExt("VK_GOOGLE_display_timing");
-    tryInjectExt("VK_EXT_frame_boundary");
-    tryInjectExt("VK_AMD_anti_lag");
-    tryInjectExt("VK_NV_low_latency2");
-    tryInjectExt("VK_KHR_present_wait");
-    tryInjectExt("VK_KHR_present_wait2");
-    tryInjectExt("VK_KHR_present_id");
-    tryInjectExt("VK_KHR_swapchain_maintenance1");
-    tryInjectExt("VK_EXT_swapchain_maintenance1");
-    tryInjectExt("VK_EXT_subgroup_size_control");
+    destroyPipe(m_lumaPipeline, m_lumaPipeLayout, m_lumaDescLayout, m_lumaShader);
+    destroyPipe(m_downsamplePipeline, m_downsamplePipeLayout, m_downsampleDescLayout, m_downsampleShader);
+    destroyPipe(m_flowPipeline, m_flowPipeLayout, m_flowDescLayout, m_flowShader);
+    destroyPipe(m_refinePipeline, m_refinePipeLayout, m_refineDescLayout, m_refineShader);
+    destroyPipe(m_warpPipeline, m_warpPipeLayout, m_warpDescLayout, m_warpShader);
+    destroyPipe(m_overlayPipeline, m_overlayPipeLayout, m_overlayDescLayout, m_overlayShader);
+}
 
-    VkDeviceCreateInfo modifiedCreateInfo = *pCreateInfo;
-    modifiedCreateInfo.enabledExtensionCount = static_cast<uint32_t>(enabledExts.size());
-    modifiedCreateInfo.ppEnabledExtensionNames = enabledExts.data();
+bool ComputeEngine::CreateLumaPipeline() {
+    m_lumaShader = CreateShaderModule(m_device, luma_pack_spv, luma_pack_spv_size);
+    if (!m_lumaShader) return false;
 
-    VkResult res = realCreateDevice(physicalDevice, &modifiedCreateInfo, pAllocator, pDevice);
+    std::vector<VkDescriptorSetLayoutBinding> bindings = {
+        {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}
+    };
+    VkDescriptorSetLayoutCreateInfo dlInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, (uint32_t)bindings.size(), bindings.data()};
+    vk(m_device).CreateDescriptorSetLayout(m_device, &dlInfo, nullptr, &m_lumaDescLayout);
+
+    VkPushConstantRange pcRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(LumaPushConstants)};
+    VkPipelineLayoutCreateInfo plInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0, 1, &m_lumaDescLayout, 1, &pcRange};
+    vk(m_device).CreatePipelineLayout(m_device, &plInfo, nullptr, &m_lumaPipeLayout);
+
+    VkPipelineShaderStageCreateInfo stageInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m_lumaShader, "main", nullptr};
+    VkComputePipelineCreateInfo pipeInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, nullptr, 0, stageInfo, m_lumaPipeLayout, VK_NULL_HANDLE, -1};
+    return vk(m_device).CreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_lumaPipeline) == VK_SUCCESS;
+}
+
+bool ComputeEngine::CreateDownsamplePipeline() {
+    m_downsampleShader = CreateShaderModule(m_device, flow_downsample_spv, flow_downsample_spv_size);
+    if (!m_downsampleShader) return false;
+
+    std::vector<VkDescriptorSetLayoutBinding> bindings = {
+        {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}
+    };
+    VkDescriptorSetLayoutCreateInfo dlInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, (uint32_t)bindings.size(), bindings.data()};
+    vk(m_device).CreateDescriptorSetLayout(m_device, &dlInfo, nullptr, &m_downsampleDescLayout);
+
+    VkPushConstantRange pcRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DownsamplePushConstants)};
+    VkPipelineLayoutCreateInfo plInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0, 1, &m_downsampleDescLayout, 1, &pcRange};
+    vk(m_device).CreatePipelineLayout(m_device, &plInfo, nullptr, &m_downsamplePipeLayout);
+
+    VkPipelineShaderStageCreateInfo stageInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m_downsampleShader, "main", nullptr};
+    VkComputePipelineCreateInfo pipeInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, nullptr, 0, stageInfo, m_downsamplePipeLayout, VK_NULL_HANDLE, -1};
+    return vk(m_device).CreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_downsamplePipeline) == VK_SUCCESS;
+}
+
+bool ComputeEngine::CreateFlowPipeline() {
+    m_flowShader = CreateShaderModule(m_device, flow_search_dp4a_spv, flow_search_dp4a_spv_size);
+    if (!m_flowShader) return false;
+
+    std::vector<VkDescriptorSetLayoutBinding> bindings = {
+        {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}
+    };
+    VkDescriptorSetLayoutCreateInfo dlInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, (uint32_t)bindings.size(), bindings.data()};
+    vk(m_device).CreateDescriptorSetLayout(m_device, &dlInfo, nullptr, &m_flowDescLayout);
+
+    VkPushConstantRange pcRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(FlowPushConstants)};
+    VkPipelineLayoutCreateInfo plInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0, 1, &m_flowDescLayout, 1, &pcRange};
+    vk(m_device).CreatePipelineLayout(m_device, &plInfo, nullptr, &m_flowPipeLayout);
+
+    VkPipelineShaderStageCreateInfo stageInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m_flowShader, "main", nullptr};
+
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT sizeControl{};
+    sizeControl.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT;
+    sizeControl.pNext = nullptr;
+    sizeControl.requiredSubgroupSize = 32;
+
+    if (ExtensionManager::Get().GetSupported().hasSubgroupSizeControl) {
+        stageInfo.pNext = &sizeControl;
+        stageInfo.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
+    }
+
+    VkComputePipelineCreateInfo pipeInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, nullptr, 0, stageInfo, m_flowPipeLayout, VK_NULL_HANDLE, -1};
+    VkResult res = vk(m_device).CreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_flowPipeline);
+    
     if (res != VK_SUCCESS) {
-        return res;
+        stageInfo.pNext = nullptr;
+        stageInfo.flags = 0;
+        pipeInfo.stage = stageInfo;
+        res = vk(m_device).CreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_flowPipeline);
+    }
+    return res == VK_SUCCESS;
+}
+
+bool ComputeEngine::CreateRefinePipeline() {
+    m_refineShader = CreateShaderModule(m_device, flow_refine_subgroup_spv, flow_refine_subgroup_spv_size);
+    if (!m_refineShader) return false;
+
+    std::vector<VkDescriptorSetLayoutBinding> bindings = {
+        {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}
+    };
+    VkDescriptorSetLayoutCreateInfo dlInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, (uint32_t)bindings.size(), bindings.data()};
+    vk(m_device).CreateDescriptorSetLayout(m_device, &dlInfo, nullptr, &m_refineDescLayout);
+
+    VkPushConstantRange pcRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(RefinePushConstants)};
+    VkPipelineLayoutCreateInfo plInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0, 1, &m_refineDescLayout, 1, &pcRange};
+    vk(m_device).CreatePipelineLayout(m_device, &plInfo, nullptr, &m_refinePipeLayout);
+
+    VkPipelineShaderStageCreateInfo stageInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m_refineShader, "main", nullptr};
+
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT sizeControl{};
+    sizeControl.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT;
+    sizeControl.pNext = nullptr;
+    sizeControl.requiredSubgroupSize = 32;
+
+    if (ExtensionManager::Get().GetSupported().hasSubgroupSizeControl) {
+        stageInfo.pNext = &sizeControl;
+        stageInfo.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
     }
 
-    // Регистрируем устройство в безопасной внутренней таблице диспетчеризации
-    DispatchManager::Get().RegisterDevice(*pDevice, nextGDPA);
-    ExtensionManager::Get().ResolveDeviceFunctions(*pDevice, nextGDPA);
+    VkComputePipelineCreateInfo pipeInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, nullptr, 0, stageInfo, m_refinePipeLayout, VK_NULL_HANDLE, -1};
+    VkResult res = vk(m_device).CreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_refinePipeline);
 
-    // Получаем свойства памяти и лимиты устройства
-    PFN_vkGetPhysicalDeviceMemoryProperties pfnGetMemProps = 
-        (PFN_vkGetPhysicalDeviceMemoryProperties)nextGIPA(VK_NULL_HANDLE, "vkGetPhysicalDeviceMemoryProperties");
-    if (pfnGetMemProps) {
-        pfnGetMemProps(physicalDevice, &g_deviceMemoryProperties);
+    if (res != VK_SUCCESS) {
+        stageInfo.pNext = nullptr;
+        stageInfo.flags = 0;
+        pipeInfo.stage = stageInfo;
+        res = vk(m_device).CreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_refinePipeline);
+    }
+    return res == VK_SUCCESS;
+}
+
+bool ComputeEngine::CreateWarpPipeline() {
+    m_warpShader = CreateShaderModule(m_device, warp_interpolate_spv, warp_interpolate_spv_size);
+    if (!m_warpShader) return false;
+
+    std::vector<VkDescriptorSetLayoutBinding> bindings = {
+        {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {4, VK_DESCRIPTOR_TYPE_SAMPLER,       1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}
+    };
+    VkDescriptorSetLayoutCreateInfo dlInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, (uint32_t)bindings.size(), bindings.data()};
+    vk(m_device).CreateDescriptorSetLayout(m_device, &dlInfo, nullptr, &m_warpDescLayout);
+
+    VkPushConstantRange pcRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(WarpPushConstants)};
+    VkPipelineLayoutCreateInfo plInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0, 1, &m_warpDescLayout, 1, &pcRange};
+    vk(m_device).CreatePipelineLayout(m_device, &plInfo, nullptr, &m_warpPipeLayout);
+
+    VkPipelineShaderStageCreateInfo stageInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m_warpShader, "main", nullptr};
+    VkComputePipelineCreateInfo pipeInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, nullptr, 0, stageInfo, m_warpPipeLayout, VK_NULL_HANDLE, -1};
+    return vk(m_device).CreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_warpPipeline) == VK_SUCCESS;
+}
+
+void ComputeEngine::BeginTimestamp(VkCommandBuffer cmd) {
+    if (m_queryPool != VK_NULL_HANDLE && vk(m_device).CmdResetQueryPool && vk(m_device).CmdWriteTimestamp) {
+        vk().CmdResetQueryPool(cmd, m_queryPool, 0, 2);
+        vk().CmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, m_queryPool, 0);
+    }
+}
+
+void ComputeEngine::EndTimestamp(VkCommandBuffer cmd) {
+    if (m_queryPool != VK_NULL_HANDLE && vk(m_device).CmdWriteTimestamp) {
+        vk().CmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, m_queryPool, 1);
+    }
+}
+
+float ComputeEngine::QueryLastGpuTimeMs() {
+    const auto& cfg = SettingsManager::Get().GetSettings();
+    uint64_t gpuNs = 0, cpuNs = 0;
+
+    if (cfg.extTimestamps != 3 && ExtensionManager::Get().QueryCalibratedTimestamps(m_device, gpuNs, cpuNs, cfg.extTimestamps)) {
+        static uint64_t prevGpuNs = 0;
+        if (prevGpuNs != 0 && gpuNs > prevGpuNs) {
+            uint64_t deltaNs = gpuNs - prevGpuNs;
+            if (deltaNs > 50000 && deltaNs < 50000000) {
+                m_lastGpuTimeMs = static_cast<float>(deltaNs) / 1000000.0f;
+            }
+        }
+        prevGpuNs = gpuNs;
+        return m_lastGpuTimeMs;
     }
 
-    VkPhysicalDeviceProperties devProps{};
-    PFN_vkGetPhysicalDeviceProperties pfnGetProps = 
-        (PFN_vkGetPhysicalDeviceProperties)nextGIPA(VK_NULL_HANDLE, "vkGetPhysicalDeviceProperties");
-    if (pfnGetProps) {
-        pfnGetProps(physicalDevice, &devProps);
+    if (m_queryPool != VK_NULL_HANDLE && vk(m_device).GetQueryPoolResults) {
+        uint64_t timestamps[2] = {0, 0};
+        VkResult res = vk(m_device).GetQueryPoolResults(
+            m_device, m_queryPool, 0, 2, sizeof(timestamps), timestamps, sizeof(uint64_t), 
+            VK_QUERY_RESULT_64_BIT
+        );
+        if (res == VK_SUCCESS && timestamps[1] > timestamps[0]) {
+            uint64_t diffNs = static_cast<uint64_t>((timestamps[1] - timestamps[0]) * m_timestampPeriod);
+            m_lastGpuTimeMs = static_cast<float>(diffNs) / 1000000.0f;
+        }
     }
+    return m_lastGpuTimeMs;
+}
 
-    float tsPeriod = (devProps.limits.timestampPeriod > 0.0f) ? devProps.limits.timestampPeriod : 1.0f;
-    Interceptor::Get().SetDeviceInfo(g_deviceMemoryProperties, g_graphicsQueueFamilyIndex, tsPeriod);
+void ComputeEngine::RecordLumaPass(VkCommandBuffer cmd, VkDescriptorSet descSet, uint32_t width, uint32_t height) {
+    vk().CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_lumaPipeline);
+    vk().CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_lumaPipeLayout, 0, 1, &descSet, 0, nullptr);
+    LumaPushConstants pc{width, height};
+    vk().CmdPushConstants(cmd, m_lumaPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(LumaPushConstants), &pc);
+    uint32_t packedW = (width + 3) / 4;
+    vk().CmdDispatch(cmd, (packedW + 15) / 16, (height + 15) / 16, 1);
+}
 
-    DeviceDispatch dispatch{};
-    dispatch.GetDeviceProcAddr = nextGDPA;
-    dispatch.DestroyDevice = (PFN_vkDestroyDevice)nextGDPA(*pDevice, "vkDestroyDevice");
-    dispatch.CreateSwapchainKHR = (PFN_vkCreateSwapchainKHR)nextGDPA(*pDevice, "vkCreateSwapchainKHR");
-    dispatch.DestroySwapchainKHR = (PFN_vkDestroySwapchainKHR)nextGDPA(*pDevice, "vkDestroySwapchainKHR");
-    dispatch.QueuePresentKHR = (PFN_vkQueuePresentKHR)nextGDPA(*pDevice, "vkQueuePresentKHR");
+void ComputeEngine::RecordDownsamplePass(VkCommandBuffer cmd, VkDescriptorSet descSet, uint32_t srcW, uint32_t srcH, uint32_t dstW, uint32_t dstH) {
+    vk().CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_downsamplePipeline);
+    vk().CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_downsamplePipeLayout, 0, 1, &descSet, 0, nullptr);
+    DownsamplePushConstants pc{srcW, srcH, dstW, dstH};
+    vk().CmdPushConstants(cmd, m_downsamplePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DownsamplePushConstants), &pc);
+    vk().CmdDispatch(cmd, (dstW + 15) / 16, (dstH + 15) / 16, 1);
+}
 
-    {
-        std::lock_guard<std::mutex> lock(g_dispatchLock);
-        g_deviceDispatches[GetDispatchKey(*pDevice)] = dispatch;
-        g_globalDeviceDispatch = dispatch;
-    }
+void ComputeEngine::RecordFlowPass(VkCommandBuffer cmd, VkDescriptorSet descSet, uint32_t width, uint32_t height, uint32_t stride) {
+    vk().CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_flowPipeline);
+    vk().CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_flowPipeLayout, 0, 1, &descSet, 0, nullptr);
+    uint32_t gridX = (width + 3) / 4;
+    uint32_t gridY = (height + 3) / 4;
+    FlowPushConstants pc{gridX, gridY, width, height, stride, 1.0f};
+    vk().CmdPushConstants(cmd, m_flowPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(FlowPushConstants), &pc);
+    vk().CmdDispatch(cmd, gridX, gridY, 1);
+}
 
-    return VK_SUCCESS;
+void ComputeEngine::RecordRefinePass(VkCommandBuffer cmd, VkDescriptorSet descSet, uint32_t width, uint32_t height) {
+    vk().CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_refinePipeline);
+    vk().CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_refinePipeLayout, 0, 1, &descSet, 0, nullptr);
+    uint32_t gridX = (width + 3) / 4;
+    uint32_t gridY = (height + 3) / 4;
+    RefinePushConstants pc{gridX, gridY, width, height};
+    vk().CmdPushConstants(cmd, m_refinePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(RefinePushConstants), &pc);
+    vk().CmdDispatch(cmd, gridX, gridY, 1);
+}
+
+void ComputeEngine::RecordWarpPass(VkCommandBuffer cmd, VkDescriptorSet descSet, const WarpPushConstants& pc, uint32_t width, uint32_t height) {
+    vk().CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_warpPipeline);
+    vk().CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_warpPipeLayout, 0, 1, &descSet, 0, nullptr);
+    vk().CmdPushConstants(cmd, m_warpPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(WarpPushConstants), &pc);
+    vk().CmdDispatch(cmd, (width + 15) / 16, (height + 15) / 16, 1);
 }
 
 } // namespace FrameFlux
-
-VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL FrameFlux_GetDeviceProcAddr(VkDevice device, const char* pName) {
-    if (!pName) return nullptr;
-    if (strcmp(pName, "vkGetDeviceProcAddr") == 0) return (PFN_vkVoidFunction)FrameFlux_GetDeviceProcAddr;
-    if (strcmp(pName, "vkCreateSwapchainKHR") == 0) return (PFN_vkVoidFunction)FrameFlux::Hook_CreateSwapchainKHR;
-    if (strcmp(pName, "vkDestroySwapchainKHR") == 0) return (PFN_vkVoidFunction)FrameFlux::Hook_DestroySwapchainKHR;
-    if (strcmp(pName, "vkQueuePresentKHR") == 0) return (PFN_vkVoidFunction)FrameFlux::Hook_QueuePresentKHR;
-
-    std::lock_guard<std::mutex> lock(FrameFlux::g_dispatchLock);
-    if (device != VK_NULL_HANDLE) {
-        void* key = FrameFlux::GetDispatchKey(device);
-        auto it = FrameFlux::g_deviceDispatches.find(key);
-        if (it != FrameFlux::g_deviceDispatches.end() && it->second.GetDeviceProcAddr) {
-            return it->second.GetDeviceProcAddr(device, pName);
-        }
-    }
-    if (FrameFlux::g_globalDeviceDispatch.GetDeviceProcAddr) {
-        return FrameFlux::g_globalDeviceDispatch.GetDeviceProcAddr(device, pName);
-    }
-    return nullptr;
-}
-
-VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL FrameFlux_GetInstanceProcAddr(VkInstance instance, const char* pName) {
-    if (!pName) return nullptr;
-    if (strcmp(pName, "vkGetInstanceProcAddr") == 0) return (PFN_vkVoidFunction)FrameFlux_GetInstanceProcAddr;
-    if (strcmp(pName, "vkGetDeviceProcAddr") == 0) return (PFN_vkVoidFunction)FrameFlux_GetDeviceProcAddr;
-    if (strcmp(pName, "vkCreateInstance") == 0) return (PFN_vkVoidFunction)FrameFlux::Hook_CreateInstance;
-    if (strcmp(pName, "vkCreateDevice") == 0) return (PFN_vkVoidFunction)FrameFlux::Hook_CreateDevice;
-    if (strcmp(pName, "vkGetPhysicalDeviceMemoryProperties") == 0) return (PFN_vkVoidFunction)FrameFlux::Hook_GetPhysicalDeviceMemoryProperties;
-    if (strcmp(pName, "vkCreateSwapchainKHR") == 0) return (PFN_vkVoidFunction)FrameFlux::Hook_CreateSwapchainKHR;
-    if (strcmp(pName, "vkDestroySwapchainKHR") == 0) return (PFN_vkVoidFunction)FrameFlux::Hook_DestroySwapchainKHR;
-    if (strcmp(pName, "vkQueuePresentKHR") == 0) return (PFN_vkVoidFunction)FrameFlux::Hook_QueuePresentKHR;
-
-    std::lock_guard<std::mutex> lock(FrameFlux::g_dispatchLock);
-    if (instance != VK_NULL_HANDLE) {
-        void* key = FrameFlux::GetDispatchKey(instance);
-        auto it = FrameFlux::g_instanceDispatches.find(key);
-        if (it != FrameFlux::g_instanceDispatches.end() && it->second.GetInstanceProcAddr) {
-            return it->second.GetInstanceProcAddr(instance, pName);
-        }
-    }
-    if (FrameFlux::g_globalInstanceDispatch.GetInstanceProcAddr) {
-        return FrameFlux::g_globalInstanceDispatch.GetInstanceProcAddr(instance, pName);
-    }
-    return nullptr;
-}
-
-VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface* pVersionStruct) {
-    if (pVersionStruct->loaderLayerInterfaceVersion < 2) return VK_ERROR_INITIALIZATION_FAILED;
-    pVersionStruct->loaderLayerInterfaceVersion = 2;
-    pVersionStruct->pfnGetInstanceProcAddr = FrameFlux_GetInstanceProcAddr;
-    pVersionStruct->pfnGetDeviceProcAddr = FrameFlux_GetDeviceProcAddr;
-    return VK_SUCCESS;
-}
-
-VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL FrameFlux_NegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface* pVersionStruct) {
-    return vkNegotiateLoaderLayerInterfaceVersion(pVersionStruct);
-}
