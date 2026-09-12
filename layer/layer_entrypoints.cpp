@@ -55,6 +55,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateSwapchainKHR(
     const VkAllocationCallbacks* pAllocator,
     VkSwapchainKHR* pSwapchain
 ) {
+    if (!device || !pCreateInfo || !pSwapchain) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
     PFN_vkCreateSwapchainKHR realFunc = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_dispatchLock);

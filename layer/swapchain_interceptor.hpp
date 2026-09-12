@@ -151,6 +151,7 @@ private:
     ComputeEngine m_computeEngine;
     bool m_computeEngineInitialized = false;
 
+    VkDevice m_cachedDevice = VK_NULL_HANDLE;
     VkPhysicalDeviceMemoryProperties m_cachedMemProps{};
     uint32_t m_cachedQueueFamily = 0;
     float m_cachedTimestampPeriod = 1.0f;

@@ -702,33 +702,35 @@ VkResult Interceptor::OnCreateSwapchainKHR(
     VkSwapchainKHR* pSwapchain,
     PFN_vkCreateSwapchainKHR realFunc
 ) {
+    if (!device || !pCreateInfo || !pSwapchain || !realFunc) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
     SettingsManager::Get().LoadOrCreate();
 
     // -------------------------------------------------------------------------
-    // ЗАПРАШИВАЕМ ПУЛ ИЗ 8 ОБРАЗОВ ДЛЯ РАБОТЫ 4x, 5x, 6x С БЕЗОПАСНЫМ СПУСКОМ
+    // БЕЗОПАСНЫЙ ЕДИНИЧНЫЙ ВЫЗОВ (БЕЗ ЦИКЛА, КОТОРЫЙ УБИВАЛ ДЕСКРИПТОР ОКНА В WINE)
     // -------------------------------------------------------------------------
-    uint32_t candidateCounts[] = { 8u, 7u, 6u, 5u, 4u };
-    VkResult result = VK_ERROR_INITIALIZATION_FAILED;
+    VkSwapchainCreateInfoKHR modifiedCreateInfo = *pCreateInfo;
+    modifiedCreateInfo.imageUsage |= (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
 
-    for (uint32_t count : candidateCounts) {
-        VkSwapchainCreateInfoKHR modifiedCreateInfo = *pCreateInfo;
-        modifiedCreateInfo.minImageCount = std::max(pCreateInfo->minImageCount + 3u, count);
-        modifiedCreateInfo.imageUsage |= (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
-
-        result = realFunc(device, &modifiedCreateInfo, pAllocator, pSwapchain);
-        if (result == VK_SUCCESS) break;
+    // Безопасно расширяем до 5-6 образов (хватает для 4x/6x и не превышает лимит X11/Wine)
+    if (modifiedCreateInfo.minImageCount < 5) {
+        modifiedCreateInfo.minImageCount = std::max(modifiedCreateInfo.minImageCount + 2u, 5u);
     }
 
+    VkResult result = realFunc(device, &modifiedCreateInfo, pAllocator, pSwapchain);
     if (result != VK_SUCCESS) {
-        VkSwapchainCreateInfoKHR fallbackInfo = *pCreateInfo;
-        fallbackInfo.imageUsage |= (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
-        result = realFunc(device, &fallbackInfo, pAllocator, pSwapchain);
+        // Запасной вызов строго с оригинальными параметрами игры
+        result = realFunc(device, pCreateInfo, pAllocator, pSwapchain);
         if (result != VK_SUCCESS) return result;
     }
 
-    if (!m_computeEngineInitialized) {
+    if (!m_computeEngineInitialized || m_cachedDevice != device) {
+        m_computeEngine.Cleanup();
         m_computeEngine.Initialize(device, m_cachedTimestampPeriod);
         m_computeEngineInitialized = true;
+        m_cachedDevice = device;
     }
 
     auto data = std::make_unique<SwapchainData>();
@@ -743,6 +745,8 @@ VkResult Interceptor::OnCreateSwapchainKHR(
 
     uint32_t imageCount = 0;
     vkGetSwapchainImagesKHR(device, *pSwapchain, &imageCount, nullptr);
+    if (imageCount == 0) return VK_SUCCESS;
+
     data->realImages.resize(imageCount);
     vkGetSwapchainImagesKHR(device, *pSwapchain, &imageCount, data->realImages.data());
 
@@ -909,20 +913,19 @@ VkResult Interceptor::OnQueuePresentKHR(
 
             uint32_t realGameImageIndex = pPresentInfo->pImageIndices[i];
 
-            // -----------------------------------------------------------------
-            // ЗАХВАТ САБКАДРОВ С ЗАЩИТОЙ ОТ ДВОЙНОГО ЗАХВАТА И СТОПОРА
+// -----------------------------------------------------------------
+            // НАДЕЖНЫЙ ЗАХВАТ САБКАДРОВ (0.5 мс таймаут позволяет брать 4x/6x без задержек)
             // -----------------------------------------------------------------
             std::vector<SubframeTask> tasks;
             if (subframesToGenerate > 0) {
                 for (uint32_t m = 0; m < subframesToGenerate; ++m) {
                     uint32_t genImg = 0;
                     VkResult acq = vkAcquireNextImageKHR(
-                        data.device, data.swapchain, 0ULL,
+                        data.device, data.swapchain, 500000ULL, // 0.5 мс таймаут
                         res.acquireSemaphores[m], VK_NULL_HANDLE, &genImg
                     );
 
                     if (acq == VK_SUCCESS || acq == VK_SUBOPTIMAL_KHR) {
-                        // Защита: нельзя писать в тот же образ, который игра сейчас показывает!
                         if (genImg != realGameImageIndex) {
                             tasks.push_back({genImg, 0.0f});
                         }
