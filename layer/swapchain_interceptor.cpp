@@ -308,7 +308,7 @@ static void RecordFullMultiFramePipeline(
             computeEngine.EndTimestamp(cmd);
         }
 
-        if (cfg.hudMode != 0 || HotkeyManager::Get().IsMenuOpen() || cfg.debugVisual == 1) {
+        if (cfg.hudMode != 0 || HotkeyManager::Get().IsMenuOpen() || cfg.debugVisual > 0) {
             RecordHudOverlay(data, cmd, computeEngine, activeMultiplier, currentFrameDeltaMs, honestOutputFpsX10);
         }
 
@@ -324,7 +324,7 @@ static void RecordFullMultiFramePipeline(
                         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, 0);
     }
 
-    if (cfg.hudMode != 0 || HotkeyManager::Get().IsMenuOpen() || cfg.debugVisual == 1) {
+    if (cfg.hudMode != 0 || HotkeyManager::Get().IsMenuOpen() || cfg.debugVisual > 0) {
         TransitionImage(cmd, data.generatedImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
         TransitionImage(cmd, data.historyFrames[currIdx], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -953,7 +953,7 @@ VkResult Interceptor::OnQueuePresentKHR(
             uint32_t honestOutputFpsX10 = static_cast<uint32_t>(displayOutputFps * 10.0f);
 
             if (tasks.empty()) {
-                if (cfg.hudMode != 0 || HotkeyManager::Get().IsMenuOpen() || cfg.debugVisual == 1) {
+                if (cfg.hudMode != 0 || HotkeyManager::Get().IsMenuOpen() || cfg.debugVisual > 0) {
                     vkWaitForFences(data.device, 1, &res.frameFence, VK_TRUE, UINT64_MAX);
                     vkResetFences(data.device, 1, &res.frameFence);
 
