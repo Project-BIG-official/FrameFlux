@@ -1,28 +1,34 @@
 // PB FrameFlux - LGPL-2.1
-// runtime/vulkan_extensions.hpp: Full Multi-Level Fallback Extensions System with Universal CI Compatibility
+// runtime/vulkan_extensions.hpp: Multi-Level Fallback Extensions System with Reflex/Anti-Lag 2 Support
 
 #pragma once
 
 #include <vulkan/vulkan.h>
+#include <vulkan/vk_layer.h>
 #include <vector>
 #include <string>
+#include <string_view>
 #include <cstring>
 #include <iostream>
+#include <algorithm>
 #include <cstdint>
 #include <cmath>
 #include <chrono>
 
 #ifdef __linux__
 #include <time.h>
+#include <dlfcn.h>
+#include <link.h>
 #endif
 
 // -----------------------------------------------------------------------------
-// 1. AMD Anti-Lag
+// 1. AMD Anti-Lag (Khronos Specification)
 // -----------------------------------------------------------------------------
 #ifndef VK_AMD_anti_lag
 #define VK_AMD_anti_lag 1
-#define VK_STRUCTURE_TYPE_ANTI_LAG_DATA_AMD ((VkStructureType)1000476000)
-#define VK_STRUCTURE_TYPE_ANTI_LAG_PRESENTATION_INFO_AMD ((VkStructureType)1000476001)
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD ((VkStructureType)1000476000)
+#define VK_STRUCTURE_TYPE_ANTI_LAG_DATA_AMD ((VkStructureType)1000476001)
+#define VK_STRUCTURE_TYPE_ANTI_LAG_PRESENTATION_INFO_AMD ((VkStructureType)1000476002)
 
 enum VkAntiLagModeAMD {
     VK_ANTI_LAG_MODE_DRIVER_CONTROL_AMD = 0,
@@ -201,7 +207,7 @@ typedef VkResult (VKAPI_PTR *PFN_vkGetRefreshCycleDurationGOOGLE)(VkDevice devic
 #endif
 
 // -----------------------------------------------------------------------------
-// 7. Calibrated Timestamps (Безопасный маппинг KHR <-> EXT для любых версий SDK)
+// 7. Calibrated Timestamps
 // -----------------------------------------------------------------------------
 #ifndef VK_EXT_calibrated_timestamps
 #define VK_EXT_calibrated_timestamps 1
@@ -259,6 +265,7 @@ struct SupportedExtensions {
     bool hasSwapchainMaintenance1 = false;
     bool hasPresentWait2 = false;
     bool hasPresentWait = false;
+    bool hasPresentId2 = false;
     bool hasPresentId = false;
     bool hasExtPresentTiming = false;
     bool hasGoogleDisplayTiming = false;
@@ -279,6 +286,12 @@ public:
     }
 
     const SupportedExtensions& GetSupported() const { return m_ext; }
+
+    bool HasAntiLag() const { return pfnAntiLagUpdateAMD != nullptr; }
+    bool HasReflex() const { return pfnSetLatencyMarkerNV != nullptr; }
+
+    void SetGameRequestedAntiLag(bool val) { m_gameRequestedAntiLag = val; }
+    bool IsGameRequestedAntiLag() const { return m_gameRequestedAntiLag; }
 
     bool IsDeviceExtensionSupportedByGPU(const char* name) const {
         for (const auto& s : m_availableGpuExtensions) {
@@ -308,6 +321,7 @@ public:
         if (strcmp(name, "VK_EXT_swapchain_maintenance1") == 0 || strcmp(name, "VK_KHR_swapchain_maintenance1") == 0) m_ext.hasSwapchainMaintenance1 = true;
         else if (strcmp(name, "VK_KHR_present_wait2") == 0) m_ext.hasPresentWait2 = true;
         else if (strcmp(name, "VK_KHR_present_wait") == 0) m_ext.hasPresentWait = true;
+        else if (strcmp(name, "VK_KHR_present_id2") == 0) m_ext.hasPresentId2 = true;
         else if (strcmp(name, "VK_KHR_present_id") == 0) m_ext.hasPresentId = true;
         else if (strcmp(name, "VK_EXT_present_timing") == 0) m_ext.hasExtPresentTiming = true;
         else if (strcmp(name, "VK_GOOGLE_display_timing") == 0) m_ext.hasGoogleDisplayTiming = true;
@@ -320,22 +334,69 @@ public:
     }
 
     void ResolveDeviceFunctions(VkDevice device, PFN_vkGetDeviceProcAddr gdpa) {
-        if (!device || !gdpa) return;
+        if (!device) return;
+        if (gdpa) m_cachedGDPA = gdpa;
+        PFN_vkGetDeviceProcAddr activeGDPA = m_cachedGDPA;
 
-        if (m_ext.hasPresentWait2) pfnWaitForPresent2KHR = (PFN_vkWaitForPresent2KHR)gdpa(device, "vkWaitForPresent2KHR");
-        if (m_ext.hasPresentWait) pfnWaitForPresentKHR = (PFN_vkWaitForPresentKHR)gdpa(device, "vkWaitForPresentKHR");
-
-        if (m_ext.hasAntiLagAMD) pfnAntiLagUpdateAMD = (PFN_vkAntiLagUpdateAMD)gdpa(device, "vkAntiLagUpdateAMD");
-        if (m_ext.hasLowLatencyNV) {
-            pfnSetLatencyMarkerNV = (PFN_vkSetLatencyMarkerNV)gdpa(device, "vkSetLatencyMarkerNV");
-            pfnLatencySleepNV = (PFN_vkLatencySleepNV)gdpa(device, "vkLatencySleepNV");
+        // 1. Resolve standard device-level extensions via active downstream GDPA
+        if (activeGDPA) {
+            if (m_ext.hasPresentWait2) pfnWaitForPresent2KHR = (PFN_vkWaitForPresent2KHR)activeGDPA(device, "vkWaitForPresent2KHR");
+            if (m_ext.hasPresentWait) pfnWaitForPresentKHR = (PFN_vkWaitForPresentKHR)activeGDPA(device, "vkWaitForPresentKHR");
+            if (m_ext.hasExtPresentTiming) pfnGetSwapchainTimingPropertiesEXT = (PFN_vkGetSwapchainTimingPropertiesEXT)activeGDPA(device, "vkGetSwapchainTimingPropertiesEXT");
+            if (m_ext.hasGoogleDisplayTiming) pfnGetRefreshCycleDurationGOOGLE = (PFN_vkGetRefreshCycleDurationGOOGLE)activeGDPA(device, "vkGetRefreshCycleDurationGOOGLE");
+            if (m_ext.hasCalibratedTimestampsKHR) pfnGetCalibratedTimestampsKHR = (PFN_vkGetCalibratedTimestampsKHR)activeGDPA(device, "vkGetCalibratedTimestampsKHR");
+            if (m_ext.hasCalibratedTimestampsEXT) pfnGetCalibratedTimestampsEXT = (PFN_vkGetCalibratedTimestampsEXT)activeGDPA(device, "vkGetCalibratedTimestampsEXT");
         }
 
-        if (m_ext.hasExtPresentTiming) pfnGetSwapchainTimingPropertiesEXT = (PFN_vkGetSwapchainTimingPropertiesEXT)gdpa(device, "vkGetSwapchainTimingPropertiesEXT");
-        if (m_ext.hasGoogleDisplayTiming) pfnGetRefreshCycleDurationGOOGLE = (PFN_vkGetRefreshCycleDurationGOOGLE)gdpa(device, "vkGetRefreshCycleDurationGOOGLE");
+        // 2. Identify the active low-latency mode in the environment
+        bool reflexEnv = (getenv("LOW_LATENCY_LAYER_REFLEX") != nullptr && strcmp(getenv("LOW_LATENCY_LAYER_REFLEX"), "0") != 0);
 
-        if (m_ext.hasCalibratedTimestampsKHR) pfnGetCalibratedTimestampsKHR = (PFN_vkGetCalibratedTimestampsKHR)gdpa(device, "vkGetCalibratedTimestampsKHR");
-        if (m_ext.hasCalibratedTimestampsEXT) pfnGetCalibratedTimestampsEXT = (PFN_vkGetCalibratedTimestampsEXT)gdpa(device, "vkGetCalibratedTimestampsEXT");
+        if (!reflexEnv) {
+            // Anti-Lag 2 mode: query entrypoints from driver or Korthos layer
+            pfnAntiLagUpdateAMD = (PFN_vkAntiLagUpdateAMD)SafeResolveUpstream(device, activeGDPA, "vkAntiLagUpdateAMD");
+            pfnSetLatencyMarkerNV = nullptr;
+            pfnLatencySleepNV = nullptr;
+
+            // Check if running in a Wine/Proton/DXVK translation environment
+#ifdef __linux__
+            bool isWineOrProton = (getenv("WINEPREFIX") != nullptr || 
+                                   getenv("STEAM_COMPAT_DATA_PATH") != nullptr || 
+                                   dlsym(RTLD_DEFAULT, "wine_get_version") != nullptr);
+
+            if (pfnAntiLagUpdateAMD && isWineOrProton && !m_gameRequestedAntiLag) {
+                std::cerr << "\n[PB FrameFlux WARNING] AMD Anti-Lag 2 is not supported via DXVK!" << std::endl;
+                std::cerr << "[PB FrameFlux WARNING] DXVK does not implement the VK_AMD_anti_lag pipeline." << std::endl;
+                std::cerr << "[PB FrameFlux WARNING] It is highly recommended to use NVIDIA Reflex instead (set LOW_LATENCY_LAYER_REFLEX=1 in launch options).\n" << std::endl;
+
+                // Disable Anti-Lag invocation in DXVK to prevent nullptr crashes in upstream layers
+                pfnAntiLagUpdateAMD = nullptr;
+            }
+#endif
+        } else {
+            // Reflex mode: query entrypoints from driver or Korthos layer
+            pfnAntiLagUpdateAMD = nullptr;
+            pfnSetLatencyMarkerNV = (PFN_vkSetLatencyMarkerNV)SafeResolveUpstream(device, activeGDPA, "vkSetLatencyMarkerNV");
+            pfnLatencySleepNV = (PFN_vkLatencySleepNV)SafeResolveUpstream(device, activeGDPA, "vkLatencySleepNV");
+        }
+    }
+
+    uint32_t GetActiveLowLatencyStatus(uint32_t debugOverride, const std::string& modeStr) const {
+        if (modeStr == "off") return 0;
+        if (debugOverride == 3) return 3;
+        if (debugOverride == 1) return (pfnAntiLagUpdateAMD != nullptr) ? 1 : 10;
+        if (debugOverride == 2) return (pfnSetLatencyMarkerNV != nullptr) ? 2 : 20;
+        if (pfnSetLatencyMarkerNV != nullptr) return 2; // Reflex active
+        if (pfnAntiLagUpdateAMD != nullptr) return 1;   // Anti-Lag active
+        return 3; // None / Unsupported
+    }
+
+    uint32_t GetActivePresentWaitStatus(uint32_t debugOverride) const {
+        if (debugOverride == 3) return 3;
+        if (debugOverride == 1) return (pfnWaitForPresent2KHR != nullptr) ? 1 : 10;
+        if (debugOverride == 2) return (pfnWaitForPresentKHR != nullptr) ? 2 : 20;
+        if (pfnWaitForPresent2KHR != nullptr) return 1;
+        if (pfnWaitForPresentKHR != nullptr) return 2;
+        return 3;
     }
 
     VkResult WaitForPresentQueue(VkDevice device, VkSwapchainKHR swapchain, uint64_t presentId, uint32_t mode = 0) {
@@ -359,12 +420,22 @@ public:
 
     void MarkAntiLagStage(VkDevice device, VkAntiLagStageAMD stage, uint64_t frameIndex, uint32_t debugOverride = 0) {
         if (debugOverride == 2 || debugOverride == 3 || debugOverride == 4) return;
+        if (!pfnAntiLagUpdateAMD || device == VK_NULL_HANDLE) return;
 
-        if (pfnAntiLagUpdateAMD && device != VK_NULL_HANDLE) {
-            VkAntiLagPresentationInfoAMD presInfo{VK_STRUCTURE_TYPE_ANTI_LAG_PRESENTATION_INFO_AMD, nullptr, stage, frameIndex};
-            VkAntiLagDataAMD data{VK_STRUCTURE_TYPE_ANTI_LAG_DATA_AMD, nullptr, VK_ANTI_LAG_MODE_ON_AMD, 0, &presInfo};
-            pfnAntiLagUpdateAMD(device, &data);
-        }
+        VkAntiLagPresentationInfoAMD presInfo{};
+        presInfo.sType = VK_STRUCTURE_TYPE_ANTI_LAG_PRESENTATION_INFO_AMD;
+        presInfo.pNext = nullptr;
+        presInfo.stage = stage;
+        presInfo.frameIndex = frameIndex;
+
+        VkAntiLagDataAMD data{};
+        data.sType = VK_STRUCTURE_TYPE_ANTI_LAG_DATA_AMD;
+        data.pNext = nullptr;
+        data.mode = VK_ANTI_LAG_MODE_DRIVER_CONTROL_AMD;
+        data.maxFPS = 0;
+        data.pPresentationInfo = &presInfo;
+
+        pfnAntiLagUpdateAMD(device, &data);
     }
 
     void MarkReflexMarker(VkDevice device, VkSwapchainKHR swapchain, VkLatencyMarkerNV marker, uint64_t frameId, uint32_t debugOverride = 0) {
@@ -377,7 +448,7 @@ public:
     }
 
     uint64_t QueryDisplayRefreshNs(VkDevice device, VkSwapchainKHR swapchain, uint32_t debugOverride = 0) {
-        if (debugOverride == 4) return 6060606ULL; // Fixed 165Hz
+        if (debugOverride == 4) return 6060606ULL;
 
         if (debugOverride != 2 && debugOverride != 3 && pfnGetSwapchainTimingPropertiesEXT && device && swapchain) {
             VkSwapchainTimingPropertiesEXT timingProps{};
@@ -433,6 +504,9 @@ private:
     std::vector<std::string> m_availableGpuExtensions;
     ExtensionManager() = default;
 
+    PFN_vkGetDeviceProcAddr m_cachedGDPA = nullptr;
+    bool m_gameRequestedAntiLag = false;
+
     PFN_vkWaitForPresent2KHR pfnWaitForPresent2KHR = nullptr;
     PFN_vkWaitForPresentKHR pfnWaitForPresentKHR = nullptr;
     PFN_vkAntiLagUpdateAMD pfnAntiLagUpdateAMD = nullptr;
@@ -442,6 +516,86 @@ private:
     PFN_vkGetRefreshCycleDurationGOOGLE pfnGetRefreshCycleDurationGOOGLE = nullptr;
     PFN_vkGetCalibratedTimestampsKHR pfnGetCalibratedTimestampsKHR = nullptr;
     PFN_vkGetCalibratedTimestampsEXT pfnGetCalibratedTimestampsEXT = nullptr;
+
+    void* SafeResolveUpstream(VkDevice device, PFN_vkGetDeviceProcAddr gdpa, const char* name) {
+        // 1. Direct query through downstream dispatch chain
+        if (gdpa && device != VK_NULL_HANDLE) {
+            void* ptr = (void*)gdpa(device, name);
+            if (ptr) return ptr;
+        }
+
+#ifdef __linux__
+        // 2. Global process symbol query
+        void* sym = dlsym(RTLD_DEFAULT, name);
+        if (sym) return sym;
+
+        // 3. Scan loaded layers (e.g. low_latency_layer)
+        struct SearchCtx {
+            VkDevice dev;
+            const char* target;
+            void* result;
+        } ctx{device, name, nullptr};
+
+        dl_iterate_phdr([](struct dl_phdr_info* info, size_t, void* data) -> int {
+            auto* s = static_cast<SearchCtx*>(data);
+            if (!info->dlpi_name || info->dlpi_name[0] == '\0') return 0;
+
+            std::string path(info->dlpi_name);
+            std::string lowerPath = path;
+            std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), ::tolower);
+
+            bool isTargetLayer = (lowerPath.find("lowlatency") != std::string::npos ||
+                                  lowerPath.find("low_latency") != std::string::npos ||
+                                  lowerPath.find("korthos") != std::string::npos);
+
+            if (isTargetLayer) {
+                void* h = dlopen(info->dlpi_name, RTLD_NOW | RTLD_LOCAL);
+                if (!h) return 0;
+
+                // A. Direct function symbol export
+                void* directSym = dlsym(h, s->target);
+                if (directSym) {
+                    s->result = directSym;
+                    return 1;
+                }
+
+                // B. Layer's GetDeviceProcAddr (e.g. LowLatency_GetDeviceProcAddr)
+                auto layerGDPA = (PFN_vkGetDeviceProcAddr)dlsym(h, "LowLatency_GetDeviceProcAddr");
+                if (!layerGDPA) layerGDPA = (PFN_vkGetDeviceProcAddr)dlsym(h, "vkGetDeviceProcAddr");
+
+                if (layerGDPA) {
+                    void* candidate = nullptr;
+                    if (s->dev != VK_NULL_HANDLE) {
+                        candidate = (void*)layerGDPA(s->dev, s->target);
+                    }
+                    if (!candidate) {
+                        candidate = (void*)layerGDPA(VK_NULL_HANDLE, s->target);
+                    }
+                    if (candidate) {
+                        s->result = candidate;
+                        return 1;
+                    }
+                }
+
+                // C. Layer's GetInstanceProcAddr
+                auto layerGIPA = (PFN_vkGetInstanceProcAddr)dlsym(h, "LowLatency_GetInstanceProcAddr");
+                if (!layerGIPA) layerGIPA = (PFN_vkGetInstanceProcAddr)dlsym(h, "vkGetInstanceProcAddr");
+
+                if (layerGIPA && !s->result) {
+                    void* candidate = (void*)layerGIPA(VK_NULL_HANDLE, s->target);
+                    if (candidate) {
+                        s->result = candidate;
+                        return 1;
+                    }
+                }
+            }
+            return 0;
+        }, &ctx);
+
+        if (ctx.result) return ctx.result;
+#endif
+        return nullptr;
+    }
 };
 
 } // namespace FrameFlux

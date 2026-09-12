@@ -97,7 +97,7 @@ static void RecordHudOverlay(
     if (queriedGpu > 0.05f && queriedGpu < 50.0f) {
         data.lastGpuTimeMs = queriedGpu;
     }
-    uint32_t gpuUs = static_cast<uint32_t>(data.lastGpuTimeMs * 1000.0f);
+    uint32_t gpuUs = (cfg.mode == "off") ? 0 : static_cast<uint32_t>(data.lastGpuTimeMs * 1000.0f);
     uint32_t cpuUs = static_cast<uint32_t>(data.lastCpuTimeMs * 1000.0f);
     
     float outputFpsFloat = static_cast<float>(honestOutputFpsX10) / 10.0f;
@@ -141,6 +141,10 @@ static void RecordHudOverlay(
                              ((confCode & 0xFF) << 8) |
                              ((cfg.extSwapchainMaint & 0xFF) << 16);
 
+    // ВАЖНО: Передаем в HUD честный статус верификации железа
+    uint32_t realActiveLL = ExtensionManager::Get().GetActiveLowLatencyStatus(cfg.extLowLatency, cfg.lowLatency);
+    uint32_t realActiveWait = ExtensionManager::Get().GetActivePresentWaitStatus(cfg.extPresentWait);
+
     OverlayPushConstants opc{
         w, h, isMenu, cfg.hudMode, selectedItem,
         modeCode, activeMultiplier, profCode, searchCode,
@@ -148,7 +152,7 @@ static void RecordHudOverlay(
         nativeFpsX10, honestOutputFpsX10, gpuUs, cpuUs, latUs,
         confidenceX10, fallbackX10, liveMemoryMb, dispHz,
         cfg.isDebugMode ? 1u : 0u,
-        cfg.menuPage, cfg.extPresentWait, cfg.extLowLatency, cfg.extDisplayTiming, cfg.extTimestamps,
+        cfg.menuPage, realActiveWait, realActiveLL, cfg.extDisplayTiming, cfg.extTimestamps,
         forceFallbackCode, cfg.debugVisual, strideAndConf
     };
 
@@ -161,6 +165,7 @@ static void RecordHudOverlay(
 
     computeEngine.RecordOverlayPass(cmd, data.overlayDescSet, opc, w, h);
 }
+
 
 struct SubframeTask {
     uint32_t destImageIndex;
@@ -869,11 +874,24 @@ VkResult Interceptor::OnQueuePresentKHR(
             if (!data.buffersAllocated) return realFunc(queue, pPresentInfo);
 
             const auto& cfg = SettingsManager::Get().GetSettings();
+            data.frameCounter++;
 
+            // 1. Dispatch latency markers (Reflex / Anti-Lag 2)
+            if (cfg.lowLatency != "off") {
+                uint32_t activeLL = ExtensionManager::Get().GetActiveLowLatencyStatus(cfg.extLowLatency, cfg.lowLatency);
+                if (activeLL == 1 && ExtensionManager::Get().HasAntiLag()) {
+                    ExtensionManager::Get().MarkAntiLagStage(data.device, VK_ANTI_LAG_STAGE_INPUT_AMD, data.frameCounter, cfg.extLowLatency);
+                    ExtensionManager::Get().MarkAntiLagStage(data.device, VK_ANTI_LAG_STAGE_PRESENT_AMD, data.frameCounter, cfg.extLowLatency);
+                } else if (activeLL == 2 && ExtensionManager::Get().HasReflex()) {
+                    ExtensionManager::Get().MarkReflexMarker(data.device, data.swapchain, VK_LATENCY_MARKER_PRESENT_START_NV, data.frameCounter, cfg.extLowLatency);
+                }
+            }
+
+            // 2. Pass-through mode (generation off, HUD / latency-only)
             if (cfg.mode == "off") {
-                if (cfg.hudMode != 0 || HotkeyManager::Get().IsMenuOpen()) {
-                    uint32_t honestOutputFpsX10 = static_cast<uint32_t>((1000.0f / std::max(1.0f, data.smoothedFrametimeMs)) * 10.0f);
-                    
+                uint32_t honestOutputFpsX10 = static_cast<uint32_t>((1000.0f / std::max(1.0f, data.smoothedFrametimeMs)) * 10.0f);
+
+                if (cfg.hudMode != 0 || HotkeyManager::Get().IsMenuOpen() || cfg.debugVisual > 0) {
                     uint32_t slot = data.currentFlightSlot;
                     FrameFlightResources& res = data.frameSlots[slot];
 
@@ -916,21 +934,34 @@ VkResult Interceptor::OnQueuePresentKHR(
                     presentReal.waitSemaphoreCount = 1;
                     presentReal.pWaitSemaphores = &res.realDoneSemaphore;
 
+                    VkResult ret = realFunc(queue, &presentReal);
+
+                    if (cfg.lowLatency != "off") {
+                        uint32_t activeLL = ExtensionManager::Get().GetActiveLowLatencyStatus(cfg.extLowLatency, cfg.lowLatency);
+                        if (activeLL == 2 && ExtensionManager::Get().HasReflex()) {
+                            ExtensionManager::Get().MarkReflexMarker(data.device, data.swapchain, VK_LATENCY_MARKER_PRESENT_END_NV, data.frameCounter, cfg.extLowLatency);
+                        }
+                    }
+
                     data.currentFlightSlot = (data.currentFlightSlot + 1) % MAX_FRAMES_IN_FLIGHT;
-                    return realFunc(queue, &presentReal);
+                    return ret;
                 }
-                return realFunc(queue, pPresentInfo);
+
+                VkResult ret = realFunc(queue, pPresentInfo);
+                if (cfg.lowLatency != "off") {
+                    uint32_t activeLL = ExtensionManager::Get().GetActiveLowLatencyStatus(cfg.extLowLatency, cfg.lowLatency);
+                    if (activeLL == 2 && ExtensionManager::Get().HasReflex()) {
+                        ExtensionManager::Get().MarkReflexMarker(data.device, data.swapchain, VK_LATENCY_MARKER_PRESENT_END_NV, data.frameCounter, cfg.extLowLatency);
+                    }
+                }
+                return ret;
             }
 
-            data.frameCounter++;
-
+            // -----------------------------------------------------------------
+            // 3. Frame Generation Pipeline (v1 / v2)
+            // -----------------------------------------------------------------
             if ((cfg.extPresentWait == 1 || cfg.extPresentWait == 2) && data.frameCounter > 10) {
                 ExtensionManager::Get().WaitForPresentQueue(data.device, data.swapchain, data.frameCounter - 1, cfg.extPresentWait);
-            }
-
-            if (cfg.lowLatency != "off") {
-                ExtensionManager::Get().MarkAntiLagStage(data.device, VK_ANTI_LAG_STAGE_PRESENT_AMD, data.frameCounter, cfg.extLowLatency);
-                ExtensionManager::Get().MarkReflexMarker(data.device, data.swapchain, VK_LATENCY_MARKER_PRESENT_START_NV, data.frameCounter, cfg.extLowLatency);
             }
 
             auto now = std::chrono::high_resolution_clock::now();
@@ -954,7 +985,7 @@ VkResult Interceptor::OnQueuePresentKHR(
 
             bool isTargetFpsMode = (cfg.targetFps > 0 && cfg.schedulerMode != "fixed");
             uint32_t subframesToGenerate = 0;
-            constexpr uint32_t MAX_GEN_SUBFRAMES = MAX_MULTIPLIER_FRAMES - 1; // до 15 сабкадров
+            constexpr uint32_t MAX_GEN_SUBFRAMES = MAX_MULTIPLIER_FRAMES - 1;
 
             if (isTargetFpsMode) {
                 float targetFpsF = static_cast<float>(cfg.targetFps);
@@ -1015,8 +1046,6 @@ VkResult Interceptor::OnQueuePresentKHR(
             }
             uint32_t honestOutputFpsX10 = static_cast<uint32_t>(displayOutputFps * 10.0f);
 
-            // КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: если сабкадров 0 (промежуточный шаг Target FPS),
-            // мы ВСЁ РАВНО обновляем историю, чтобы не скакать назад во времени!
             if (tasks.empty()) {
                 vk(data.device).WaitForFences(data.device, 1, &res.frameFence, VK_TRUE, UINT64_MAX);
                 vk(data.device).ResetFences(data.device, 1, &res.frameFence);
@@ -1057,8 +1086,17 @@ VkResult Interceptor::OnQueuePresentKHR(
                 presentReal.waitSemaphoreCount = 1;
                 presentReal.pWaitSemaphores = &res.realDoneSemaphore;
 
+                VkResult ret = realFunc(queue, &presentReal);
+
+                if (cfg.lowLatency != "off") {
+                    uint32_t activeLL = ExtensionManager::Get().GetActiveLowLatencyStatus(cfg.extLowLatency, cfg.lowLatency);
+                    if (activeLL == 2 && ExtensionManager::Get().HasReflex()) {
+                        ExtensionManager::Get().MarkReflexMarker(data.device, data.swapchain, VK_LATENCY_MARKER_PRESENT_END_NV, data.frameCounter, cfg.extLowLatency);
+                    }
+                }
+
                 data.currentFlightSlot = (data.currentFlightSlot + 1) % MAX_FRAMES_IN_FLIGHT;
-                return realFunc(queue, &presentReal);
+                return ret;
             }
 
             float stepT = 1.0f / static_cast<float>(tasks.size() + 1);
@@ -1137,10 +1175,14 @@ VkResult Interceptor::OnQueuePresentKHR(
             VkPresentInfoKHR presentReal = *pPresentInfo;
             presentReal.waitSemaphoreCount = 1;
             presentReal.pWaitSemaphores = &res.realDoneSemaphore;
-            realFunc(queue, &presentReal);
+
+            VkResult retReal = realFunc(queue, &presentReal);
 
             if (cfg.lowLatency != "off") {
-                ExtensionManager::Get().MarkReflexMarker(data.device, data.swapchain, VK_LATENCY_MARKER_PRESENT_END_NV, data.frameCounter, cfg.extLowLatency);
+                uint32_t activeLL = ExtensionManager::Get().GetActiveLowLatencyStatus(cfg.extLowLatency, cfg.lowLatency);
+                if (activeLL == 2 && ExtensionManager::Get().HasReflex()) {
+                    ExtensionManager::Get().MarkReflexMarker(data.device, data.swapchain, VK_LATENCY_MARKER_PRESENT_END_NV, data.frameCounter, cfg.extLowLatency);
+                }
             }
 
             auto cpuEndTime = std::chrono::high_resolution_clock::now();

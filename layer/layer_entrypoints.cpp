@@ -1,5 +1,5 @@
 // PB FrameFlux - LGPL-2.1
-// layer/layer_entrypoints.cpp: Robust Multi-Device & Queue Interceptor
+// layer/layer_entrypoints.cpp: Robust Multi-Device & Extension Discovery Interceptor
 
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_layer.h>
@@ -20,6 +20,8 @@
 
 namespace FrameFlux {
 
+static VkInstance g_instance = VK_NULL_HANDLE;
+static PFN_vkGetInstanceProcAddr g_instanceGIPA = nullptr;
 static VkPhysicalDeviceMemoryProperties g_deviceMemoryProperties{};
 static uint32_t g_graphicsQueueFamilyIndex = 0;
 
@@ -120,6 +122,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateSwapchainKHR(
         return VK_ERROR_INITIALIZATION_FAILED;
     }
 
+    // ТЕПЕРЬ low_latency_layer гарантированно завершил создание VkDevice
+    // и успешно вернет валидный указатель на vkAntiLagUpdateAMD!
+    ExtensionManager::Get().ResolveDeviceFunctions(device, nullptr);
+
     PFN_vkCreateSwapchainKHR realFunc = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_dispatchLock);
@@ -130,6 +136,61 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateSwapchainKHR(
 
     if (!realFunc) return VK_ERROR_INITIALIZATION_FAILED;
     return Interceptor::Get().OnCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain, realFunc);
+}
+
+// Добавьте реализацию хука перечисления расширений:
+static VKAPI_ATTR VkResult VKAPI_CALL Hook_EnumerateDeviceExtensionProperties(
+    VkPhysicalDevice physicalDevice,
+    const char* pLayerName,
+    uint32_t* pPropertyCount,
+    VkExtensionProperties* pProperties
+) {
+    PFN_vkEnumerateDeviceExtensionProperties realFunc = nullptr;
+    if (g_instance && g_instanceGIPA) {
+        realFunc = (PFN_vkEnumerateDeviceExtensionProperties)g_instanceGIPA(g_instance, "vkEnumerateDeviceExtensionProperties");
+    }
+    if (!realFunc) {
+        std::lock_guard<std::mutex> lock(g_dispatchLock);
+        if (g_globalInstanceDispatch.GetInstanceProcAddr) {
+            realFunc = (PFN_vkEnumerateDeviceExtensionProperties)g_globalInstanceDispatch.GetInstanceProcAddr(g_instance, "vkEnumerateDeviceExtensionProperties");
+        }
+    }
+
+    if (!realFunc) return VK_ERROR_INITIALIZATION_FAILED;
+
+    // Сначала получаем расширения от нижестоящих слоев и драйвера
+    uint32_t rawCount = 0;
+    VkResult res = realFunc(physicalDevice, pLayerName, &rawCount, nullptr);
+    if (res != VK_SUCCESS) return res;
+
+    std::vector<VkExtensionProperties> exts(rawCount);
+    res = realFunc(physicalDevice, pLayerName, &rawCount, exts.data());
+    if (res != VK_SUCCESS) return res;
+
+    // Внедряем расширения low-latency, чтобы игра (CS2/DXVK) увидела их в своем меню!
+    auto addExtIfMissing = [&](const char* name, uint32_t specVersion) {
+        for (const auto& e : exts) {
+            if (strcmp(e.extensionName, name) == 0) return;
+        }
+        VkExtensionProperties prop{};
+        strncpy(prop.extensionName, name, VK_MAX_EXTENSION_NAME_SIZE - 1);
+        prop.specVersion = specVersion;
+        exts.push_back(prop);
+    };
+
+    addExtIfMissing("VK_AMD_anti_lag", 1);
+    addExtIfMissing("VK_NV_low_latency2", 2);
+
+    if (!pProperties) {
+        *pPropertyCount = static_cast<uint32_t>(exts.size());
+        return VK_SUCCESS;
+    }
+
+    uint32_t toCopy = std::min(*pPropertyCount, static_cast<uint32_t>(exts.size()));
+    std::memcpy(pProperties, exts.data(), toCopy * sizeof(VkExtensionProperties));
+    *pPropertyCount = toCopy;
+
+    return (toCopy < exts.size()) ? VK_INCOMPLETE : VK_SUCCESS;
 }
 
 static VKAPI_ATTR void VKAPI_CALL Hook_DestroySwapchainKHR(
@@ -168,10 +229,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(
         }
     }
 
-    if (!realFunc) {
-        std::cerr << "[HOOK ERROR] realFunc for vkQueuePresentKHR is NULL!" << std::endl;
-        return VK_ERROR_INITIALIZATION_FAILED;
-    }
+    if (!realFunc) return VK_ERROR_INITIALIZATION_FAILED;
     return Interceptor::Get().OnQueuePresentKHR(queue, pPresentInfo, realFunc);
 }
 
@@ -223,6 +281,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateInstance(
     VkResult res = realCreateInstance(pCreateInfo, pAllocator, pInstance);
     if (res != VK_SUCCESS) return res;
 
+    g_instance = *pInstance;
+    g_instanceGIPA = nextGIPA;
+
     InstanceDispatch dispatch{};
     dispatch.GetInstanceProcAddr = nextGIPA;
     dispatch.DestroyInstance = (PFN_vkDestroyInstance)nextGIPA(*pInstance, "vkDestroyInstance");
@@ -267,6 +328,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
     if (!nextGIPA || !nextGDPA) return VK_ERROR_INITIALIZATION_FAILED;
 
     PFN_vkCreateDevice realCreateDevice = (PFN_vkCreateDevice)nextGIPA(VK_NULL_HANDLE, "vkCreateDevice");
+    if (!realCreateDevice && g_instance) {
+        realCreateDevice = (PFN_vkCreateDevice)nextGIPA(g_instance, "vkCreateDevice");
+    }
     if (!realCreateDevice) {
         std::lock_guard<std::mutex> lock(g_dispatchLock);
         if (g_globalInstanceDispatch.GetInstanceProcAddr) {
@@ -277,8 +341,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
 
     chainInfo->u.pLayerInfo = chainInfo->u.pLayerInfo->pNext;
 
-    PFN_vkEnumerateDeviceExtensionProperties pfnEnum = 
-        (PFN_vkEnumerateDeviceExtensionProperties)nextGIPA(VK_NULL_HANDLE, "vkEnumerateDeviceExtensionProperties");
+    // Enumerate physical GPU extensions via g_instance
+    PFN_vkEnumerateDeviceExtensionProperties pfnEnum = nullptr;
+    if (g_instance) {
+        if (g_instanceGIPA) {
+            pfnEnum = (PFN_vkEnumerateDeviceExtensionProperties)g_instanceGIPA(g_instance, "vkEnumerateDeviceExtensionProperties");
+        }
+        if (!pfnEnum) {
+            pfnEnum = (PFN_vkEnumerateDeviceExtensionProperties)nextGIPA(g_instance, "vkEnumerateDeviceExtensionProperties");
+        }
+    }
     if (pfnEnum) {
         ExtensionManager::Get().CollectGpuExtensions(physicalDevice, pfnEnum);
     }
@@ -288,11 +360,18 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
         for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; ++i) {
             enabledExts.push_back(pCreateInfo->ppEnabledExtensionNames[i]);
             ExtensionManager::Get().NotifyExtensionActivated(pCreateInfo->ppEnabledExtensionNames[i]);
+
+            // Check if game natively requested Anti-Lag (e.g. Linux native CS2)
+            if (strcmp(pCreateInfo->ppEnabledExtensionNames[i], "VK_AMD_anti_lag") == 0) {
+                ExtensionManager::Get().SetGameRequestedAntiLag(true);
+            }
         }
     }
 
-    auto tryInjectExt = [&](const char* extName) -> bool {
-        if (ExtensionManager::Get().IsDeviceExtensionSupportedByGPU(extName)) {
+    bool hasLowLatencyEnv = (getenv("LOW_LATENCY_LAYER") != nullptr && strcmp(getenv("LOW_LATENCY_LAYER"), "0") != 0);
+
+    auto tryInjectExt = [&](const char* extName, bool force = false) -> bool {
+        if (force || ExtensionManager::Get().IsDeviceExtensionSupportedByGPU(extName)) {
             for (const char* existing : enabledExts) {
                 if (strcmp(existing, extName) == 0) return true;
             }
@@ -303,19 +382,25 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
         return false;
     };
 
+    // Core timing and synchronization extensions
     tryInjectExt("VK_KHR_calibrated_timestamps");
     tryInjectExt("VK_EXT_calibrated_timestamps");
     tryInjectExt("VK_EXT_present_timing");
     tryInjectExt("VK_GOOGLE_display_timing");
     tryInjectExt("VK_EXT_frame_boundary");
-    tryInjectExt("VK_AMD_anti_lag");
-    tryInjectExt("VK_NV_low_latency2");
+    tryInjectExt("VK_EXT_subgroup_size_control");
+
+    // Present wait & queue drain extensions
+    tryInjectExt("VK_KHR_present_id");
+    tryInjectExt("VK_KHR_present_id2");
     tryInjectExt("VK_KHR_present_wait");
     tryInjectExt("VK_KHR_present_wait2");
-    tryInjectExt("VK_KHR_present_id");
     tryInjectExt("VK_KHR_swapchain_maintenance1");
     tryInjectExt("VK_EXT_swapchain_maintenance1");
-    tryInjectExt("VK_EXT_subgroup_size_control");
+
+    // Low latency extensions
+    tryInjectExt("VK_AMD_anti_lag", hasLowLatencyEnv);
+    tryInjectExt("VK_NV_low_latency2", hasLowLatencyEnv || getenv("LOW_LATENCY_LAYER_REFLEX") != nullptr);
 
     VkDeviceCreateInfo modifiedCreateInfo = *pCreateInfo;
     modifiedCreateInfo.enabledExtensionCount = static_cast<uint32_t>(enabledExts.size());
@@ -329,15 +414,25 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
     DispatchManager::Get().RegisterDevice(*pDevice, nextGDPA);
     ExtensionManager::Get().ResolveDeviceFunctions(*pDevice, nextGDPA);
 
-    PFN_vkGetPhysicalDeviceMemoryProperties pfnGetMemProps = 
-        (PFN_vkGetPhysicalDeviceMemoryProperties)nextGIPA(VK_NULL_HANDLE, "vkGetPhysicalDeviceMemoryProperties");
+    PFN_vkGetPhysicalDeviceMemoryProperties pfnGetMemProps = nullptr;
+    if (g_instance && g_instanceGIPA) {
+        pfnGetMemProps = (PFN_vkGetPhysicalDeviceMemoryProperties)g_instanceGIPA(g_instance, "vkGetPhysicalDeviceMemoryProperties");
+    }
+    if (!pfnGetMemProps && g_instance) {
+        pfnGetMemProps = (PFN_vkGetPhysicalDeviceMemoryProperties)nextGIPA(g_instance, "vkGetPhysicalDeviceMemoryProperties");
+    }
     if (pfnGetMemProps) {
         pfnGetMemProps(physicalDevice, &g_deviceMemoryProperties);
     }
 
     VkPhysicalDeviceProperties devProps{};
-    PFN_vkGetPhysicalDeviceProperties pfnGetProps = 
-        (PFN_vkGetPhysicalDeviceProperties)nextGIPA(VK_NULL_HANDLE, "vkGetPhysicalDeviceProperties");
+    PFN_vkGetPhysicalDeviceProperties pfnGetProps = nullptr;
+    if (g_instance && g_instanceGIPA) {
+        pfnGetProps = (PFN_vkGetPhysicalDeviceProperties)g_instanceGIPA(g_instance, "vkGetPhysicalDeviceProperties");
+    }
+    if (!pfnGetProps && g_instance) {
+        pfnGetProps = (PFN_vkGetPhysicalDeviceProperties)nextGIPA(g_instance, "vkGetPhysicalDeviceProperties");
+    }
     if (pfnGetProps) {
         pfnGetProps(physicalDevice, &devProps);
     }
@@ -360,7 +455,6 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
         g_globalDeviceDispatch = dispatch;
     }
 
-    // Предварительно связываем все очереди созданного устройства
     if (dispatch.GetDeviceQueue) {
         for (uint32_t q = 0; q < pCreateInfo->queueCreateInfoCount; ++q) {
             uint32_t qFam = pCreateInfo->pQueueCreateInfos[q].queueFamilyIndex;
@@ -407,6 +501,7 @@ VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL FrameFlux_GetInstancePr
     if (!pName) return nullptr;
     if (strcmp(pName, "vkGetInstanceProcAddr") == 0) return (PFN_vkVoidFunction)FrameFlux_GetInstanceProcAddr;
     if (strcmp(pName, "vkGetDeviceProcAddr") == 0) return (PFN_vkVoidFunction)FrameFlux_GetDeviceProcAddr;
+    if (strcmp(pName, "vkEnumerateDeviceExtensionProperties") == 0) return (PFN_vkVoidFunction)FrameFlux::Hook_EnumerateDeviceExtensionProperties; // <-- ДОБАВИТЬ
     if (strcmp(pName, "vkGetDeviceQueue") == 0) return (PFN_vkVoidFunction)FrameFlux::Hook_GetDeviceQueue;
     if (strcmp(pName, "vkGetDeviceQueue2") == 0) return (PFN_vkVoidFunction)FrameFlux::Hook_GetDeviceQueue2;
     if (strcmp(pName, "vkCreateInstance") == 0) return (PFN_vkVoidFunction)FrameFlux::Hook_CreateInstance;
