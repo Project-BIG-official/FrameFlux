@@ -39,9 +39,9 @@ public:
     bool IsMenuOpen() const { return m_menuOpen; }
     uint32_t GetSelectedItem() const { return m_selectedItem; }
 
-void PollHotkeys() {
+    void PollHotkeys() {
         #ifdef __linux__
-        // Опрашиваем X11 только каждый 4-й кадр для устранения лишней нагрузки на CPU
+        // Опрашиваем X11 только каждый 4-й кадр, если меню закрыто
         static uint32_t pollThrottle = 0;
         if ((++pollThrottle & 3) != 0 && !m_menuOpen) {
             return;
@@ -56,7 +56,11 @@ void PollHotkeys() {
         }
 
         char currentKeys[32];
-        pfnXQueryKeymap(m_display, currentKeys);
+        try {
+            pfnXQueryKeymap(m_display, currentKeys);
+        } catch (...) {
+            return;
+        }
 
         auto isDown = [&](KeyCode kc) -> bool {
             if (kc == 0) return false;
