@@ -10,7 +10,7 @@ on:
 
 jobs:
   build-matrix:
-    runs-on: ubuntu-22.04 # Базовый glibc 2.35 для универсальной совместимости
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
@@ -36,21 +36,12 @@ jobs:
           sudo ldconfig
           slangc -version
 
-      - name: Configure CMake
+      - name: Configure CMake (Native Matching Build)
         run: |
-          # Для v4 ограничиваем вектор до 256 бит, чтобы не ломать контекст Wine/Proton
-          EXTRA_FLAGS=""
-          if [ "${{ matrix.arch }}" = "x86-64-v4" ]; then
-            EXTRA_FLAGS="-DCMAKE_CXX_FLAGS=-mprefer-vector-width=256"
-          fi
-
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CXX_COMPILER=g++-12 \
-            -DFRAMEFLUX_ARCH=${{ matrix.arch }} \
-            -DFRAMEFLUX_ENABLE_LTO=OFF \
-            -DFRAMEFLUX_STATIC_STDLIB=ON \
-            $EXTRA_FLAGS
+            -DFRAMEFLUX_ARCH=${{ matrix.arch }}
 
       - name: Compile PB FrameFlux
         run: cmake --build build --parallel $(nproc)

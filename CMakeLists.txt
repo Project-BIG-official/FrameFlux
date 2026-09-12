@@ -10,48 +10,26 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # -----------------------------------------------------------------------------
-# Optimization & Portability Options
+# Options
 # -----------------------------------------------------------------------------
-option(FRAMEFLUX_ENABLE_LTO "Enable Link-Time Optimization (LTO)" OFF) # OFF by default for fast dev
-option(FRAMEFLUX_STATIC_STDLIB "Statically link libstdc++ and libgcc" OFF)
 set(FRAMEFLUX_ARCH "native" CACHE STRING "Target CPU architecture: native, x86-64-v2, x86-64-v3, x86-64-v4")
 
-if(FRAMEFLUX_ARCH STREQUAL "x86-64-v4")
-    # Ограничиваем вектор до 256 бит, чтобы не крашить 32-битный контекст Wine/Proton ZMM регистрами
-    add_compile_options(-mprefer-vector-width=256)
-endif()
-
-# Basic compiler warnings
 add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 
-# Architecture optimization flag
+# Архитектурная оптимизация
 if(NOT FRAMEFLUX_ARCH STREQUAL "none")
     add_compile_options(-march=${FRAMEFLUX_ARCH})
+    if(FRAMEFLUX_ARCH STREQUAL "x86-64-v4")
+        # Ограничение 256-бит для AVX-512, чтобы не ломать контекст Wine
+        add_compile_options(-mprefer-vector-width=256)
+    endif()
     message(STATUS "[FrameFlux] Targeting CPU architecture: -march=${FRAMEFLUX_ARCH}")
 endif()
 
-# Release Mode Extreme Optimizations
+# Release Optimizations (без ломающих Wine флагов -fno-plt и -z,now)
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
-    add_compile_options(-O3 -fno-plt)
-    add_link_options(-Wl,-O1 -Wl,--as-needed -Wl,-z,relro -Wl,-z,now)
-
-    # Static C++ Runtime for universal glibcxx portability
-    if(FRAMEFLUX_STATIC_STDLIB)
-        add_link_options(-static-libgcc -static-libstdc++)
-        message(STATUS "[FrameFlux] Statically linking libgcc & libstdc++")
-    endif()
-
-    # Link-Time Optimization (LTO)
-    if(FRAMEFLUX_ENABLE_LTO)
-        include(CheckIPOSupported)
-        check_ipo_supported(RESULT ipo_supported OUTPUT ipo_error)
-        if(ipo_supported)
-            set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
-            message(STATUS "[FrameFlux] Link-Time Optimization (LTO) ENABLED")
-        else()
-            message(WARNING "[FrameFlux] LTO not supported: ${ipo_error}")
-        endif()
-    endif()
+    add_compile_options(-O3)
+    add_link_options(-Wl,-O1 -Wl,--as-needed)
 endif()
 
 # -----------------------------------------------------------------------------
@@ -107,7 +85,6 @@ add_custom_target(FrameFluxShaders DEPENDS ${GENERATED_SPV_HEADERS})
 # -----------------------------------------------------------------------------
 # Build Layer Target
 # -----------------------------------------------------------------------------
-
 set(LAYER_SOURCES
     layer/layer_entrypoints.cpp
     layer/swapchain_interceptor.cpp
@@ -125,6 +102,7 @@ set(LAYER_SOURCES
 set(LAYER_HEADERS
     layer/swapchain_interceptor.hpp
     layer/compute_engine.hpp
+    layer/vulkan_dispatch.hpp
 )
 
 add_library(VkLayer_projectbig_frameflux SHARED
