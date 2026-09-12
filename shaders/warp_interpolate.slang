@@ -1,5 +1,5 @@
 // PB FrameFlux - LGPL-2.1
-// warp_interpolate.slang: Anti-Ghosting Warping with Bi-Directional Clamping & OptiScaler Vector Grid
+// warp_interpolate.slang: Ghost-Free Warping with Zero-Blend Disocclusion & UI Edge Locking
 
 enum FallbackAction : uint {
     RepeatFrame = 0,
@@ -54,7 +54,6 @@ float2 getFilteredMotion(float2 uv) {
     return clamp(v4, min(midMin, midMax), max(midMin, midMax));
 }
 
-// Двунаправленный цветовой бокс: учитывает окрестности ОБОИХ кадров A и B для полного устранения гостинга
 void getNeighborhoodBoxBi(uint2 pixelCoord, out float3 boxMin, out float3 boxMax) {
     int2 center = int2(pixelCoord);
     int2 maxCoord = int2(pc.resolution) - 1;
@@ -116,7 +115,7 @@ void computeMain(uint3 dispatchThreadID : SV_DispatchThreadID) {
     float4 rawB = frameB[pixelCoord];
 
     // =========================================================================
-    // 0. LIVE DEBUG VISUALIZERS (OPTISCALER ARROWS & MIDDLEBURY FLOW)
+    // 0. LIVE DEBUG VISUALIZERS
     // =========================================================================
     if (pc.showDebugWatermark == 3) {
         uint legendSize = 90;
@@ -220,22 +219,34 @@ void computeMain(uint3 dispatchThreadID : SV_DispatchThreadID) {
     }
 
     // =========================================================================
-    // 1. STATIC UI & INTERFACE PROTECTION
-    // =========================================================================
-    float2 motionCheck = getFilteredMotion(uv);
-    float colorDiff = distance(rawA.rgb, rawB.rgb);
-
-    if (colorDiff < 0.035 && length(motionCheck) < 1.0) {
-        outputFrame[pixelCoord] = (pc.t < 0.5) ? rawA : rawB;
-        return;
-    }
-
-    // =========================================================================
-    // 2. TRANSIENT PARTICLE & RAIN DETECTION
+    // 1. ЗАЩИТА СТАТИЧЕСКИХ ГРАНИЦ И МЕНЮ (ПОЛНОЕ ИСКЛЮЧЕНИЕ ДВОЕНИЯ КАРТОЧЕК)
     // =========================================================================
     int2 coord = int2(pixelCoord);
     int2 clampMax = int2(pc.resolution) - 1;
 
+    float lumaCenterA = dot(rawA.rgb, float3(0.299, 0.587, 0.114));
+    float lumaCenterB = dot(rawB.rgb, float3(0.299, 0.587, 0.114));
+
+    float lumaRA = dot(frameA[clamp(coord + int2(1, 0), int2(0), clampMax)].rgb, float3(0.299, 0.587, 0.114));
+    float lumaDA = dot(frameA[clamp(coord + int2(0, 1), int2(0), clampMax)].rgb, float3(0.299, 0.587, 0.114));
+    float lumaRB = dot(frameB[clamp(coord + int2(1, 0), int2(0), clampMax)].rgb, float3(0.299, 0.587, 0.114));
+    float lumaDB = dot(frameB[clamp(coord + int2(0, 1), int2(0), clampMax)].rgb, float3(0.299, 0.587, 0.114));
+
+    float gradA = abs(lumaCenterA - lumaRA) + abs(lumaCenterA - lumaDA);
+    float gradB = abs(lumaCenterB - lumaRB) + abs(lumaCenterB - lumaDB);
+
+    // Граница статична, если ее координаты и резкость совпадают в обоих кадрах
+    bool isStaticUI = (gradA > 0.05 && gradB > 0.05 && abs(gradA - gradB) < 0.04);
+    float colorDiff = distance(rawA.rgb, rawB.rgb);
+
+    if (isStaticUI || colorDiff < 0.02) {
+        outputFrame[pixelCoord] = rawB;
+        return;
+    }
+
+    // =========================================================================
+    // 2. ДЕТЕКТОР ЧАСТИЦ
+    // =========================================================================
     float4 nbL = frameB[clamp(coord + int2(-1,  0), int2(0), clampMax)];
     float4 nbR = frameB[clamp(coord + int2( 1,  0), int2(0), clampMax)];
     float4 nbU = frameB[clamp(coord + int2( 0, -1), int2(0), clampMax)];
@@ -251,33 +262,20 @@ void computeMain(uint3 dispatchThreadID : SV_DispatchThreadID) {
     float localContrastB = length(rawB.rgb - avgBNeighbors);
     float localContrastA = length(rawA.rgb - avgANeighbors);
 
-    bool isRainParticleB = (localContrastB > 0.075 && localContrastA < 0.025);
-    bool isRainParticleA = (localContrastA > 0.075 && localContrastB < 0.025);
-
-    if (isRainParticleB) {
+    if (localContrastB > 0.075 && localContrastA < 0.025) {
         outputFrame[pixelCoord] = (pc.t < 0.35) ? rawA : lerp(rawA, rawB, smoothstep(0.35, 1.0, pc.t));
         return;
     }
-
-    if (isRainParticleA) {
+    if (localContrastA > 0.075 && localContrastB < 0.025) {
         outputFrame[pixelCoord] = (pc.t > 0.65) ? rawB : lerp(rawA, rawB, smoothstep(0.0, 0.65, pc.t));
         return;
     }
 
     // =========================================================================
-    // 3. MOTION-COMPENSATED WARPING
+    // 3. ЧИСТЫЙ ВАРПИНГ БЕЗ ПАРАЗИТНОГО ДВОЕНИЯ
     // =========================================================================
-    float2 motion = motionCheck;
+    float2 motion = getFilteredMotion(uv);
     float confidence = confidenceMap.SampleLevel(linearSampler, uv, 0.0);
-
-    if (confidence < pc.confidenceThreshold) {
-        if (pc.fallbackAction == FallbackAction::BlendFrame) {
-            outputFrame[pixelCoord] = lerp(rawA, rawB, 0.5);
-        } else {
-            outputFrame[pixelCoord] = (pc.t < 0.5) ? rawA : rawB;
-        }
-        return;
-    }
 
     float2 motionUV = motion * pc.invResolution;
     float2 uvA = uv - (motionUV * pc.t);
@@ -286,28 +284,27 @@ void computeMain(uint3 dispatchThreadID : SV_DispatchThreadID) {
     float4 sampleA = sampleColor(frameA, uvA);
     float4 sampleB = sampleColor(frameB, uvB);
 
-    // =========================================================================
-    // 4. ANTI-GHOSTING DISOCCLUSION CHECK & BI-DIRECTIONAL COLOR CLAMPING
-    // =========================================================================
     float lumaA = dot(sampleA.rgb, float3(0.299, 0.587, 0.114));
     float lumaB = dot(sampleB.rgb, float3(0.299, 0.587, 0.114));
     float photometricDiff = abs(lumaA - lumaB);
 
     float motionSpeed = length(motion);
-    float disocclusionThreshold = lerp(0.12, 0.25, saturate(motionSpeed / 12.0));
+    float disocclusionThreshold = lerp(0.06, 0.16, saturate(motionSpeed / 10.0));
 
     float4 finalColor;
-    if (photometricDiff > disocclusionThreshold) {
-        // Дизокклюзия: берем ближайший во времени кадр для устранения раздвоения
-        finalColor = (pc.t < 0.5) ? sampleA : sampleB;
+    if (confidence < pc.confidenceThreshold || photometricDiff > disocclusionThreshold) {
+        // При расхождении цветов жестко берем ближайший сэмпл без полупрозрачного двоения
+        if (pc.fallbackAction == FallbackAction::BlendFrame) {
+            finalColor = lerp(rawA, rawB, pc.t);
+        } else {
+            finalColor = (pc.t < 0.5) ? rawA : rawB;
+        }
     } else {
+        // Плавная интерполяция со строгим ограничением палитры
         float4 interpolated = lerp(sampleA, sampleB, pc.t);
-
         float3 boxMin, boxMax;
         getNeighborhoodBoxBi(pixelCoord, boxMin, boxMax);
-        
-        float3 padding = float3(lerp(0.015, 0.035, saturate(motionSpeed / 16.0)));
-        float3 clampedRgb = clamp(interpolated.rgb, boxMin - padding, boxMax + padding);
+        float3 clampedRgb = clamp(interpolated.rgb, boxMin, boxMax);
 
         finalColor = float4(clampedRgb, interpolated.a);
     }

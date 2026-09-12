@@ -1,5 +1,5 @@
 // PB FrameFlux - LGPL-2.1
-// layer/swapchain_interceptor.cpp: Safe Non-Blocking Multi-Frame Swapchain Interceptor
+// layer/swapchain_interceptor.cpp: Synchronized History Pipeline & Ghost-Free Scheduler
 
 #include <algorithm>
 #include <iostream>
@@ -167,15 +167,12 @@ struct SubframeTask {
     float t;
 };
 
-static void RecordFullMultiFramePipeline(
+// Функция, которая гарантированно регистрирует кадр игры в истории
+static void UpdateHistoryAndPipelines(
     SwapchainData& data,
     VkCommandBuffer cmd,
     uint32_t sourceGameImageIndex,
-    const ::std::vector<SubframeTask>& subframes,
-    ComputeEngine& computeEngine,
-    uint32_t activeMultiplier,
-    float currentFrameDeltaMs,
-    uint32_t honestOutputFpsX10
+    ComputeEngine& computeEngine
 ) {
     uint32_t w = data.extent.width;
     uint32_t h = data.extent.height;
@@ -192,12 +189,11 @@ static void RecordFullMultiFramePipeline(
     fullCopyRegion.extent = {w, h, 1};
 
     const auto& cfg = SettingsManager::Get().GetSettings();
-    computeEngine.BeginTimestamp(cmd);
 
     if (!data.historyInitialized) {
         TransitionImage(cmd, data.realImages[sourceGameImageIndex], VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-        
+
         TransitionImage(cmd, data.historyFrames[prevIdx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
         vk().CmdCopyImage(cmd, data.realImages[sourceGameImageIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -275,7 +271,35 @@ static void RecordFullMultiFramePipeline(
         TransitionImage(cmd, data.confidenceImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
     }
+}
 
+static void RecordFullMultiFramePipeline(
+    SwapchainData& data,
+    VkCommandBuffer cmd,
+    uint32_t sourceGameImageIndex,
+    const ::std::vector<SubframeTask>& subframes,
+    ComputeEngine& computeEngine,
+    uint32_t activeMultiplier,
+    float currentFrameDeltaMs,
+    uint32_t honestOutputFpsX10
+) {
+    uint32_t w = data.extent.width;
+    uint32_t h = data.extent.height;
+
+    uint32_t currIdx = data.frameCounter % 2;
+
+    VkImageCopy fullCopyRegion{};
+    fullCopyRegion.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    fullCopyRegion.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    fullCopyRegion.extent = {w, h, 1};
+
+    const auto& cfg = SettingsManager::Get().GetSettings();
+    computeEngine.BeginTimestamp(cmd);
+
+    // 1. Всегда актуализируем историю
+    UpdateHistoryAndPipelines(data, cmd, sourceGameImageIndex, computeEngine);
+
+    // 2. Параметры варпинга
     float resolvedConf = (cfg.confOverride > 0.0f) ? cfg.confOverride : ((cfg.mode == "v1") ? 2.0f : 0.55f);
     uint32_t resolvedFallback = (cfg.fallbackAction == "repeat") ? 0 : ((cfg.fallbackAction == "drop") ? 2 : 1);
 
@@ -290,6 +314,7 @@ static void RecordFullMultiFramePipeline(
         resolvedFallback = 2;
     }
 
+    // 3. Генерация всех сабкадров
     for (size_t s = 0; s < subframes.size(); ++s) {
         TransitionImage(cmd, data.generatedImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_WRITE_BIT);
@@ -326,9 +351,9 @@ static void RecordFullMultiFramePipeline(
                         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, 0);
     }
 
+    // 4. Завершение реального кадра
     if (cfg.hudMode != 0 || HotkeyManager::Get().IsMenuOpen() || cfg.debugVisual > 0) {
         if (cfg.debugVisual >= 2) {
-            // Для полного устранения мерцания при визуализации векторов рендерим Warp-проход и на реальном кадре
             TransitionImage(cmd, data.generatedImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
                             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_WRITE_BIT);
 
@@ -377,7 +402,7 @@ static void RecordFullMultiFramePipeline(
     }
 }
 
-static void RecordRealFrameOverlayPass(
+static void RecordZeroSubframeHistoryUpdatePass(
     SwapchainData& data,
     VkCommandBuffer cmd,
     uint32_t imageIndex,
@@ -392,29 +417,37 @@ static void RecordRealFrameOverlayPass(
     fullCopyRegion.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     fullCopyRegion.extent = {w, h, 1};
 
-    TransitionImage(cmd, data.realImages[imageIndex], VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-    TransitionImage(cmd, data.generatedImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+    const auto& cfg = SettingsManager::Get().GetSettings();
 
-    vk().CmdCopyImage(cmd, data.realImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                      data.generatedImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &fullCopyRegion);
+    // Обязательно актуализируем историю кадров, даже если сабкадров 0
+    UpdateHistoryAndPipelines(data, cmd, imageIndex, computeEngine);
 
-    TransitionImage(cmd, data.generatedImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    if (cfg.hudMode != 0 || HotkeyManager::Get().IsMenuOpen() || cfg.debugVisual > 0) {
+        TransitionImage(cmd, data.generatedImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
 
-    RecordHudOverlay(data, cmd, computeEngine, 1u, 16.6f, honestOutputFpsX10);
+        vk().CmdCopyImage(cmd, data.realImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                          data.generatedImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &fullCopyRegion);
 
-    TransitionImage(cmd, data.generatedImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-    TransitionImage(cmd, data.realImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        TransitionImage(cmd, data.generatedImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
 
-    vk().CmdCopyImage(cmd, data.generatedImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                      data.realImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &fullCopyRegion);
+        RecordHudOverlay(data, cmd, computeEngine, 1u, 16.6f, honestOutputFpsX10);
 
-    TransitionImage(cmd, data.realImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, 0);
+        TransitionImage(cmd, data.generatedImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        TransitionImage(cmd, data.realImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+
+        vk().CmdCopyImage(cmd, data.generatedImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                          data.realImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &fullCopyRegion);
+
+        TransitionImage(cmd, data.realImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, 0);
+    } else {
+        TransitionImage(cmd, data.realImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, 0);
+    }
 }
 
 Interceptor& Interceptor::Get() {
@@ -663,16 +696,20 @@ bool Interceptor::AllocateFrameBuffers(SwapchainData& data) {
 
     for (uint32_t slot = 0; slot < MAX_FRAMES_IN_FLIGHT; ++slot) {
         std::vector<VkCommandBuffer> bufs(MAX_MULTIPLIER_FRAMES + 1);
-        vk(data.device).AllocateCommandBuffers(data.device, &cmdAllocInfo, bufs.data());
+        if (vk(data.device).AllocateCommandBuffers) {
+            vk(data.device).AllocateCommandBuffers(data.device, &cmdAllocInfo, bufs.data());
+        }
         for (uint32_t m = 0; m < MAX_MULTIPLIER_FRAMES; ++m) {
             data.frameSlots[slot].genCommandBuffers[m] = bufs[m];
-            vk(data.device).CreateSemaphore(data.device, &semInfo, nullptr, &data.frameSlots[slot].genDoneSemaphores[m]);
-            vk(data.device).CreateSemaphore(data.device, &semInfo, nullptr, &data.frameSlots[slot].acquireSemaphores[m]);
+            if (vk(data.device).CreateSemaphore) {
+                vk(data.device).CreateSemaphore(data.device, &semInfo, nullptr, &data.frameSlots[slot].genDoneSemaphores[m]);
+                vk(data.device).CreateSemaphore(data.device, &semInfo, nullptr, &data.frameSlots[slot].acquireSemaphores[m]);
+            }
         }
         data.frameSlots[slot].realCommandBuffer = bufs[MAX_MULTIPLIER_FRAMES];
 
-        vk(data.device).CreateFence(data.device, &fenceInfo, nullptr, &data.frameSlots[slot].frameFence);
-        vk(data.device).CreateSemaphore(data.device, &semInfo, nullptr, &data.frameSlots[slot].realDoneSemaphore);
+        if (vk(data.device).CreateFence) vk(data.device).CreateFence(data.device, &fenceInfo, nullptr, &data.frameSlots[slot].frameFence);
+        if (vk(data.device).CreateSemaphore) vk(data.device).CreateSemaphore(data.device, &semInfo, nullptr, &data.frameSlots[slot].realDoneSemaphore);
     }
 
     data.buffersAllocated = true;
@@ -737,17 +774,24 @@ VkResult Interceptor::OnCreateSwapchainKHR(
 
     SettingsManager::Get().LoadOrCreate();
 
+    // Запрашиваем 16 образов для полноценного покрытия высоких частот Target FPS (360 Гц)
     VkSwapchainCreateInfoKHR modifiedCreateInfo = *pCreateInfo;
     modifiedCreateInfo.imageUsage |= (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
 
-    if (modifiedCreateInfo.minImageCount < 5) {
-        modifiedCreateInfo.minImageCount = std::max(modifiedCreateInfo.minImageCount + 2u, 5u);
-    }
+    modifiedCreateInfo.minImageCount = std::max(modifiedCreateInfo.minImageCount + 6u, 16u);
 
     VkResult result = realFunc(device, &modifiedCreateInfo, pAllocator, pSwapchain);
     if (result != VK_SUCCESS) {
-        result = realFunc(device, pCreateInfo, pAllocator, pSwapchain);
-        if (result != VK_SUCCESS) return result;
+        modifiedCreateInfo.minImageCount = std::max(pCreateInfo->minImageCount + 4u, 10u);
+        result = realFunc(device, &modifiedCreateInfo, pAllocator, pSwapchain);
+        if (result != VK_SUCCESS) {
+            modifiedCreateInfo.minImageCount = std::max(pCreateInfo->minImageCount + 2u, 6u);
+            result = realFunc(device, &modifiedCreateInfo, pAllocator, pSwapchain);
+            if (result != VK_SUCCESS) {
+                result = realFunc(device, pCreateInfo, pAllocator, pSwapchain);
+                if (result != VK_SUCCESS) return result;
+            }
+        }
     }
 
     if (!m_computeEngineInitialized || m_cachedDevice != device) {
@@ -843,7 +887,7 @@ VkResult Interceptor::OnQueuePresentKHR(
                     bInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
                     vk(data.device).BeginCommandBuffer(realCmd, &bInfo);
 
-                    RecordRealFrameOverlayPass(data, realCmd, pPresentInfo->pImageIndices[i], m_computeEngine, honestOutputFpsX10);
+                    RecordZeroSubframeHistoryUpdatePass(data, realCmd, pPresentInfo->pImageIndices[i], m_computeEngine, honestOutputFpsX10);
 
                     vk(data.device).EndCommandBuffer(realCmd);
 
@@ -910,6 +954,7 @@ VkResult Interceptor::OnQueuePresentKHR(
 
             bool isTargetFpsMode = (cfg.targetFps > 0 && cfg.schedulerMode != "fixed");
             uint32_t subframesToGenerate = 0;
+            constexpr uint32_t MAX_GEN_SUBFRAMES = MAX_MULTIPLIER_FRAMES - 1; // до 15 сабкадров
 
             if (isTargetFpsMode) {
                 float targetFpsF = static_cast<float>(cfg.targetFps);
@@ -922,7 +967,7 @@ VkResult Interceptor::OnQueuePresentKHR(
                     data.fractionalDebt += extraNeeded;
 
                     uint32_t requested = static_cast<uint32_t>(data.fractionalDebt);
-                    subframesToGenerate = std::min(requested, 5u);
+                    subframesToGenerate = std::min(requested, MAX_GEN_SUBFRAMES);
                 }
             } else {
                 uint32_t activeMultiplier = std::clamp(cfg.multiplier, 2u, 6u);
@@ -952,7 +997,7 @@ VkResult Interceptor::OnQueuePresentKHR(
 
             if (isTargetFpsMode) {
                 data.fractionalDebt -= static_cast<float>(tasks.size());
-                data.fractionalDebt = std::clamp(data.fractionalDebt, 0.0f, 2.0f);
+                data.fractionalDebt = std::clamp(data.fractionalDebt, 0.0f, static_cast<float>(MAX_GEN_SUBFRAMES));
             }
 
             float currentOutputCount = static_cast<float>(tasks.size() + 1);
@@ -970,51 +1015,50 @@ VkResult Interceptor::OnQueuePresentKHR(
             }
             uint32_t honestOutputFpsX10 = static_cast<uint32_t>(displayOutputFps * 10.0f);
 
+            // КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: если сабкадров 0 (промежуточный шаг Target FPS),
+            // мы ВСЁ РАВНО обновляем историю, чтобы не скакать назад во времени!
             if (tasks.empty()) {
-                if (cfg.hudMode != 0 || HotkeyManager::Get().IsMenuOpen() || cfg.debugVisual > 0) {
-                    vk(data.device).WaitForFences(data.device, 1, &res.frameFence, VK_TRUE, UINT64_MAX);
-                    vk(data.device).ResetFences(data.device, 1, &res.frameFence);
+                vk(data.device).WaitForFences(data.device, 1, &res.frameFence, VK_TRUE, UINT64_MAX);
+                vk(data.device).ResetFences(data.device, 1, &res.frameFence);
 
-                    VkCommandBuffer realCmd = res.realCommandBuffer;
-                    vk(data.device).ResetCommandBuffer(realCmd, 0);
-                    VkCommandBufferBeginInfo bInfo{};
-                    bInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-                    bInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-                    vk(data.device).BeginCommandBuffer(realCmd, &bInfo);
+                VkCommandBuffer realCmd = res.realCommandBuffer;
+                vk(data.device).ResetCommandBuffer(realCmd, 0);
+                VkCommandBufferBeginInfo bInfo{};
+                bInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+                bInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                vk(data.device).BeginCommandBuffer(realCmd, &bInfo);
 
-                    RecordRealFrameOverlayPass(data, realCmd, pPresentInfo->pImageIndices[i], m_computeEngine, honestOutputFpsX10);
+                RecordZeroSubframeHistoryUpdatePass(data, realCmd, realGameImageIndex, m_computeEngine, honestOutputFpsX10);
 
-                    vk(data.device).EndCommandBuffer(realCmd);
+                vk(data.device).EndCommandBuffer(realCmd);
 
-                    std::vector<VkSemaphore> waitSems;
-                    std::vector<VkPipelineStageFlags> waitStages;
-                    if (pPresentInfo->waitSemaphoreCount > 0 && pPresentInfo->pWaitSemaphores) {
-                        for (uint32_t s = 0; s < pPresentInfo->waitSemaphoreCount; ++s) {
-                            waitSems.push_back(pPresentInfo->pWaitSemaphores[s]);
-                            waitStages.push_back(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
-                        }
+                std::vector<VkSemaphore> waitSems;
+                std::vector<VkPipelineStageFlags> waitStages;
+                if (pPresentInfo->waitSemaphoreCount > 0 && pPresentInfo->pWaitSemaphores) {
+                    for (uint32_t s = 0; s < pPresentInfo->waitSemaphoreCount; ++s) {
+                        waitSems.push_back(pPresentInfo->pWaitSemaphores[s]);
+                        waitStages.push_back(VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
                     }
-
-                    VkSubmitInfo realSubmit{};
-                    realSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-                    realSubmit.waitSemaphoreCount = static_cast<uint32_t>(waitSems.size());
-                    realSubmit.pWaitSemaphores = waitSems.data();
-                    realSubmit.pWaitDstStageMask = waitStages.data();
-                    realSubmit.commandBufferCount = 1;
-                    realSubmit.pCommandBuffers = &realCmd;
-                    realSubmit.signalSemaphoreCount = 1;
-                    realSubmit.pSignalSemaphores = &res.realDoneSemaphore;
-
-                    vk(data.device).QueueSubmit(queue, 1, &realSubmit, res.frameFence);
-
-                    VkPresentInfoKHR presentReal = *pPresentInfo;
-                    presentReal.waitSemaphoreCount = 1;
-                    presentReal.pWaitSemaphores = &res.realDoneSemaphore;
-
-                    data.currentFlightSlot = (data.currentFlightSlot + 1) % MAX_FRAMES_IN_FLIGHT;
-                    return realFunc(queue, &presentReal);
                 }
-                return realFunc(queue, pPresentInfo);
+
+                VkSubmitInfo realSubmit{};
+                realSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+                realSubmit.waitSemaphoreCount = static_cast<uint32_t>(waitSems.size());
+                realSubmit.pWaitSemaphores = waitSems.data();
+                realSubmit.pWaitDstStageMask = waitStages.data();
+                realSubmit.commandBufferCount = 1;
+                realSubmit.pCommandBuffers = &realCmd;
+                realSubmit.signalSemaphoreCount = 1;
+                realSubmit.pSignalSemaphores = &res.realDoneSemaphore;
+
+                vk(data.device).QueueSubmit(queue, 1, &realSubmit, res.frameFence);
+
+                VkPresentInfoKHR presentReal = *pPresentInfo;
+                presentReal.waitSemaphoreCount = 1;
+                presentReal.pWaitSemaphores = &res.realDoneSemaphore;
+
+                data.currentFlightSlot = (data.currentFlightSlot + 1) % MAX_FRAMES_IN_FLIGHT;
+                return realFunc(queue, &presentReal);
             }
 
             float stepT = 1.0f / static_cast<float>(tasks.size() + 1);

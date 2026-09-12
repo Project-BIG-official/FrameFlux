@@ -1,5 +1,5 @@
 // PB FrameFlux - LGPL-2.1
-// layer/swapchain_interceptor.hpp: Multi-Frame Scalable Ring Synchronization with Zero-Copy Ping-Pong
+// layer/swapchain_interceptor.hpp: Multi-Frame Scalable Ring Synchronization
 
 #pragma once
 
@@ -24,7 +24,7 @@ enum class FrameFluxMode {
 };
 
 constexpr uint32_t MAX_FRAMES_IN_FLIGHT = 2;
-constexpr uint32_t MAX_MULTIPLIER_FRAMES = 6;
+constexpr uint32_t MAX_MULTIPLIER_FRAMES = 16;
 
 struct FrameFlightResources {
     VkCommandBuffer genCommandBuffers[MAX_MULTIPLIER_FRAMES]{};
@@ -55,9 +55,6 @@ struct SwapchainData {
     FrameFlightResources frameSlots[MAX_FRAMES_IN_FLIGHT];
     uint32_t currentFlightSlot = 0;
 
-    // -------------------------------------------------------------------------
-    // Zero-Copy Ping-Pong Ring Buffers: Index 0 and Index 1
-    // -------------------------------------------------------------------------
     VkImage historyFrames[2]{VK_NULL_HANDLE, VK_NULL_HANDLE};
     VkDeviceMemory historyFrameMemory[2]{VK_NULL_HANDLE, VK_NULL_HANDLE};
     VkImageView historyFrameViews[2]{VK_NULL_HANDLE, VK_NULL_HANDLE};
@@ -70,7 +67,6 @@ struct SwapchainData {
     VkDeviceMemory historyLumaHalfMemory[2]{VK_NULL_HANDLE, VK_NULL_HANDLE};
     VkImageView historyLumaHalfViews[2]{VK_NULL_HANDLE, VK_NULL_HANDLE};
 
-    // Shared intermediate motion & generation textures
     VkImage dummyCoarseImage = VK_NULL_HANDLE;
     VkDeviceMemory dummyCoarseMemory = VK_NULL_HANDLE;
     VkImageView dummyCoarseView = VK_NULL_HANDLE;
@@ -94,7 +90,6 @@ struct SwapchainData {
     VkSampler linearSampler = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
 
-    // Dual Ping-Pong pre-baked Descriptor Sets (Parity 0 and Parity 1)
     VkDescriptorSet lumaDescSet[2]{VK_NULL_HANDLE, VK_NULL_HANDLE};
     VkDescriptorSet downsampleDescSet[2]{VK_NULL_HANDLE, VK_NULL_HANDLE};
     VkDescriptorSet coarseFlowDescSet[2]{VK_NULL_HANDLE, VK_NULL_HANDLE};
