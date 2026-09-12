@@ -1,16 +1,16 @@
-name: Build Universal PB FrameFlux Release
+name: Build PB FrameFlux Artifacts
 
 on:
   push:
-    tags:
-      - 'v*'
     branches:
       - main
+    tags:
+      - 'v*'
   pull_request:
 
 jobs:
   build-matrix:
-    runs-on: ubuntu-22.04 # Base glibc 2.35 for universal Linux & SteamOS compatibility
+    runs-on: ubuntu-22.04 # Базовый glibc 2.35 для универсальной совместимости
     strategy:
       fail-fast: false
       matrix:
@@ -27,7 +27,6 @@ jobs:
 
       - name: Install Slang Compiler (slangc)
         run: |
-          # Use verified stable release of Slang
           SLANG_VERSION="2025.23.1"
           echo "[+] Downloading Slang v${SLANG_VERSION}..."
           curl -fL "https://github.com/shader-slang/slang/releases/download/v${SLANG_VERSION}/slang-${SLANG_VERSION}-linux-x86_64.zip" -o slang.zip
@@ -37,14 +36,21 @@ jobs:
           sudo ldconfig
           slangc -version
 
-      - name: Configure CMake (Extreme Optimization + Static Libstdc++)
+      - name: Configure CMake
         run: |
+          # Для v4 ограничиваем вектор до 256 бит, чтобы не ломать контекст Wine/Proton
+          EXTRA_FLAGS=""
+          if [ "${{ matrix.arch }}" = "x86-64-v4" ]; then
+            EXTRA_FLAGS="-DCMAKE_CXX_FLAGS=-mprefer-vector-width=256"
+          fi
+
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CXX_COMPILER=g++-12 \
             -DFRAMEFLUX_ARCH=${{ matrix.arch }} \
-            -DFRAMEFLUX_ENABLE_LTO=ON \
-            -DFRAMEFLUX_STATIC_STDLIB=ON
+            -DFRAMEFLUX_ENABLE_LTO=OFF \
+            -DFRAMEFLUX_STATIC_STDLIB=ON \
+            $EXTRA_FLAGS
 
       - name: Compile PB FrameFlux
         run: cmake --build build --parallel $(nproc)
@@ -58,6 +64,7 @@ jobs:
           mkdir -p "$DIST_DIR"
           cp build/libVkLayer_projectbig_frameflux.so "$DIST_DIR/"
           cp build/VkLayer_projectbig_frameflux.json "$DIST_DIR/"
+          cp install.sh "$DIST_DIR/" 2>/dev/null || true
           cp LICENSE* "$DIST_DIR/" 2>/dev/null || true
           tar -czvf "PB-FrameFlux-${{ matrix.arch }}.tar.gz" "$DIST_DIR"
 
@@ -66,20 +73,3 @@ jobs:
         with:
           name: PB-FrameFlux-${{ matrix.arch }}
           path: "PB-FrameFlux-${{ matrix.arch }}.tar.gz"
-
-  publish-release:
-    needs: build-matrix
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download all built artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: release-artifacts
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: release-artifacts/**/*.tar.gz
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

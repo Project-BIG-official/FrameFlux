@@ -15,7 +15,8 @@
 #ifdef VK_LAYER_EXPORT
 #undef VK_LAYER_EXPORT
 #endif
-#define VK_LAYER_EXPORT extern "C" __attribute__((visibility("default")))
+// Добавлен атрибут 'used', чтобы компилятор и компоновщик ни при каких оптимизациях не вырезали функции слоя
+#define VK_LAYER_EXPORT extern "C" __attribute__((visibility("default"), used))
 
 namespace FrameFlux {
 
